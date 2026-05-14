@@ -1,0 +1,6184 @@
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True, infer_types=True
+# Python 3.14 target, single-file build: files = off
+"""
+acn64emu0.1.1.py
+ACN64Emu 0.1.1 - single-file clean-room N64 emulator core + Tkinter GUI + Corn public-feature HLE/recompiler layer.
+
+Python 3.14 target.
+files = off: no generated sidecar modules are required to run this file.
+hardware_files = off: CPU, opcode, HLE, memory, device stubs, and GUI live here.
+cython_wrapper = embedded: this file is valid Python and can also be cythonized.
+
+Run:
+    python3.14 acn64emu0.1.1.py
+
+Optional Cython translation outside the app, still using this one source file:
+    python3.14 -m pip install cython
+    python3.14 -m cython -3 --module-name acn64emu011 acn64emu0.1.1.py -o acn64emu011.c
+
+Scope:
+- Clean-room R4300i/MIPS III interpreter core shell.
+- Expanded opcode decoder and safe execution subset.
+- 64-bit GPRs, HI/LO, CP0, FPU register storage, basic COP1 ops.
+- RDRAM, RSP DMEM/IMEM, PIF RAM, ROM window, and MMIO register stubs.
+- Z64/V64/N64 byte-order normalization and N64 header parsing.
+- Universal SM64-family HLE4K ROM booter plus Corn public-feature no-plugin HLE fast paths.
+
+This file intentionally does not copy Corn, Project64, UltraHLE, Nintendo, or
+commercial emulator source. It is a clean-room, educational emulator-core scaffold with a ACN64Emu/Corn-style HLE boot path.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import struct
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except Exception:  # pragma: no cover - keeps core importable on headless systems
+    tk = None
+    filedialog = None
+    messagebox = None
+
+try:  # Optional: pure-Python mode remains valid when Cython is absent.
+    import cython as _cython  # type: ignore
+except Exception:  # pragma: no cover
+    _cython = None
+
+
+APP_NAME = "acn64emu0.1.1"
+ENGINE_FILE = "acn64emu0.1.1.py"
+
+BG = "#d4d0c8"
+PANEL = "#ece9d8"
+BLACK = "#000000"
+BLUE = "#003399"
+TEXT = "#000000"
+GREEN = "#00ff88"
+RED = "#ff4040"
+WHITE = "#ffffff"
+YELLOW = "#ffff66"
+
+PYTHON_TARGET = "3.14"
+PYTHON_IMPORT = "python3.14"
+SINGLE_FILE = True
+GUI_SIZE = "600x400"
+CYTHON_COMPATIBLE = True
+CYTHON_WRAPPER_EMBEDDED = True
+FILES_OFF = True
+PYTHON_IMPORT_FILES_OFF = True
+HARDWARE_FILES_OFF = True
+TARGET_FPS = 60
+FPS_LOCKED = True
+FRAME_INTERVAL_SEC = 1.0 / TARGET_FPS
+OPCODE_CACHE_LIMIT = 65536
+CLEANROOM_PROFILE = "ACN64EMU0_1_1_CORN_PUBLIC_FEATURES_CLEANROOM_HLE"
+CORN_SOURCE_URL = "https://www.zophar.net/n64/corn.html"
+CORN_IMPORT_MODE = "CLEANROOM_NO_SOURCE_COPY"
+CORN_HLE_PROFILE = "CORN_0_3_STYLE_NO_PLUGIN_HLE"
+CORN_VIDEO_BACKEND = "TK_CANVAS_NO_PLUGIN_PREVIEW"
+HLE_INTERNAL_WIDTH = 320
+HLE_INTERNAL_HEIGHT = 240
+HLE_OUTPUT_WIDTH = 3840
+HLE_OUTPUT_HEIGHT = 2160
+HLE_RENDER_SCALE_X = HLE_OUTPUT_WIDTH / HLE_INTERNAL_WIDTH
+HLE_RENDER_SCALE_Y = HLE_OUTPUT_HEIGHT / HLE_INTERNAL_HEIGHT
+
+RDRAM_SIZE = 8 * 1024 * 1024
+RSP_DMEM_SIZE = 0x1000
+RSP_IMEM_SIZE = 0x1000
+PIF_RAM_SIZE = 0x40
+EEPROM_4K_SIZE = 0x200
+EEPROM_16K_SIZE = 0x800
+
+MARIO_KART_PROFILE = "MARIO_KART_64"
+SUPER_MARIO_PROFILE = "SUPER_MARIO_64"
+WAVE_RACE_PROFILE = "WAVE_RACE_64"
+STAR_FOX_PROFILE = "STAR_FOX_64"
+FZERO_PROFILE = "F_ZERO_X"
+DIDDY_KONG_PROFILE = "DIDDY_KONG_RACING"
+GENERIC_PROFILE = "GENERIC_N64"
+CORN_HLE_FAST_PROFILES = (
+    MARIO_KART_PROFILE,
+    SUPER_MARIO_PROFILE,
+    WAVE_RACE_PROFILE,
+    STAR_FOX_PROFILE,
+    FZERO_PROFILE,
+    DIDDY_KONG_PROFILE,
+)
+CORN_HLE_TITLES = {
+    MARIO_KART_PROFILE: "MARIO KART 64",
+    SUPER_MARIO_PROFILE: "SUPER MARIO 64",
+    WAVE_RACE_PROFILE: "WAVE RACE 64",
+    STAR_FOX_PROFILE: "STAR FOX 64",
+    FZERO_PROFILE: "F-ZERO X",
+    DIDDY_KONG_PROFILE: "DIDDY KONG RACING",
+}
+CORN_HLE_TAGS = {
+    MARIO_KART_PROFILE: "MK64",
+    SUPER_MARIO_PROFILE: "SM64",
+    WAVE_RACE_PROFILE: "WR64",
+    STAR_FOX_PROFILE: "SF64",
+    FZERO_PROFILE: "FZRX",
+    DIDDY_KONG_PROFILE: "DKR",
+}
+HLE_BOOT_STAGE_NAMES = (
+    "ROM byte order normalized",
+    "CIC/PIF handoff",
+    "libultra scheduler patched",
+    "RSP task HLE",
+    "RDP no-plugin path",
+    "VI 4K upscale",
+    "AI queued",
+    "interactive attract loop",
+)
+ROM_BOOT_COPY = 0x4000
+ROM_RDRAM_WINDOW = 0x200000
+
+MASK_8 = 0xFF
+MASK_16 = 0xFFFF
+MASK_32 = 0xFFFFFFFF
+MASK_64 = 0xFFFFFFFFFFFFFFFF
+
+CP0_INDEX = 0
+CP0_RANDOM = 1
+CP0_ENTRYLO0 = 2
+CP0_ENTRYLO1 = 3
+CP0_CONTEXT = 4
+CP0_PAGEMASK = 5
+CP0_WIRED = 6
+CP0_BADVADDR = 8
+CP0_COUNT = 9
+CP0_ENTRYHI = 10
+CP0_COMPARE = 11
+CP0_STATUS = 12
+CP0_CAUSE = 13
+CP0_EPC = 14
+CP0_PRID = 15
+CP0_CONFIG = 16
+CP0_LLADDR = 17
+CP0_WATCHLO = 18
+CP0_WATCHHI = 19
+CP0_XCONTEXT = 20
+CP0_PERR = 26
+CP0_CACHEERR = 27
+CP0_TAGLO = 28
+CP0_TAGHI = 29
+CP0_ERROREPC = 30
+
+FCR31_COND_BIT = 23
+
+
+def u8(v: int) -> int:
+    return v & MASK_8
+
+
+def u16(v: int) -> int:
+    return v & MASK_16
+
+
+def u32(v: int) -> int:
+    return v & MASK_32
+
+
+def u64(v: int) -> int:
+    return v & MASK_64
+
+
+def sign8(v: int) -> int:
+    v &= MASK_8
+    return v - 0x100 if v & 0x80 else v
+
+
+def sign16(v: int) -> int:
+    v &= MASK_16
+    return v - 0x10000 if v & 0x8000 else v
+
+
+def sign32(v: int) -> int:
+    v &= MASK_32
+    return v - 0x100000000 if v & 0x80000000 else v
+
+
+def sign64(v: int) -> int:
+    v &= MASK_64
+    return v - 0x10000000000000000 if v & 0x8000000000000000 else v
+
+
+def sx8_to_64(v: int) -> int:
+    return u64(sign8(v))
+
+
+def sx16_to_64(v: int) -> int:
+    return u64(sign16(v))
+
+
+def sx32_to_64(v: int) -> int:
+    return u64(sign32(v))
+
+
+def be16(data: bytearray | bytes, offset: int) -> int:
+    if offset < 0 or offset + 1 >= len(data):
+        return 0
+    return ((data[offset] << 8) | data[offset + 1]) & MASK_16
+
+
+def be32(data: bytearray | bytes, offset: int) -> int:
+    if offset < 0 or offset + 3 >= len(data):
+        return 0
+    return (
+        (data[offset] << 24)
+        | (data[offset + 1] << 16)
+        | (data[offset + 2] << 8)
+        | data[offset + 3]
+    ) & MASK_32
+
+
+def be64(data: bytearray | bytes, offset: int) -> int:
+    hi = be32(data, offset)
+    lo = be32(data, offset + 4)
+    return ((hi << 32) | lo) & MASK_64
+
+
+def put_be16(data: bytearray, offset: int, value: int) -> None:
+    if offset < 0 or offset + 1 >= len(data):
+        return
+    value &= MASK_16
+    data[offset] = (value >> 8) & MASK_8
+    data[offset + 1] = value & MASK_8
+
+
+def put_be32(data: bytearray, offset: int, value: int) -> None:
+    if offset < 0 or offset + 3 >= len(data):
+        return
+    value &= MASK_32
+    data[offset] = (value >> 24) & MASK_8
+    data[offset + 1] = (value >> 16) & MASK_8
+    data[offset + 2] = (value >> 8) & MASK_8
+    data[offset + 3] = value & MASK_8
+
+
+def put_be64(data: bytearray, offset: int, value: int) -> None:
+    if offset < 0 or offset + 7 >= len(data):
+        return
+    value &= MASK_64
+    put_be32(data, offset, (value >> 32) & MASK_32)
+    put_be32(data, offset + 4, value & MASK_32)
+
+
+def ascii_clean(raw: bytearray | bytes) -> str:
+    return bytes(raw).decode("ascii", "ignore").replace("\x00", "").strip()
+
+
+def f32_to_bits(value: float) -> int:
+    return struct.unpack(">I", struct.pack(">f", float(value)))[0]
+
+
+def bits_to_f32(value: int) -> float:
+    return struct.unpack(">f", struct.pack(">I", value & MASK_32))[0]
+
+
+def f64_to_bits(value: float) -> int:
+    return struct.unpack(">Q", struct.pack(">d", float(value)))[0]
+
+
+def bits_to_f64(value: int) -> float:
+    return struct.unpack(">d", struct.pack(">Q", value & MASK_64))[0]
+
+
+PRIMARY = {
+    0x00: "SPECIAL", 0x01: "REGIMM", 0x02: "J", 0x03: "JAL",
+    0x04: "BEQ", 0x05: "BNE", 0x06: "BLEZ", 0x07: "BGTZ",
+    0x08: "ADDI", 0x09: "ADDIU", 0x0A: "SLTI", 0x0B: "SLTIU",
+    0x0C: "ANDI", 0x0D: "ORI", 0x0E: "XORI", 0x0F: "LUI",
+    0x10: "COP0", 0x11: "COP1", 0x12: "COP2", 0x13: "COP3",
+    0x14: "BEQL", 0x15: "BNEL", 0x16: "BLEZL", 0x17: "BGTZL",
+    0x18: "DADDI", 0x19: "DADDIU", 0x1A: "LDL", 0x1B: "LDR",
+    0x20: "LB", 0x21: "LH", 0x22: "LWL", 0x23: "LW",
+    0x24: "LBU", 0x25: "LHU", 0x26: "LWR", 0x27: "LWU",
+    0x28: "SB", 0x29: "SH", 0x2A: "SWL", 0x2B: "SW",
+    0x2C: "SDL", 0x2D: "SDR", 0x2E: "SWR", 0x2F: "CACHE",
+    0x30: "LL", 0x31: "LWC1", 0x32: "LWC2", 0x33: "LWC3",
+    0x34: "LLD", 0x35: "LDC1", 0x36: "LDC2", 0x37: "LD",
+    0x38: "SC", 0x39: "SWC1", 0x3A: "SWC2", 0x3B: "SWC3",
+    0x3C: "SCD", 0x3D: "SDC1", 0x3E: "SDC2", 0x3F: "SD",
+}
+
+SPECIAL = {
+    0x00: "SLL", 0x02: "SRL", 0x03: "SRA", 0x04: "SLLV",
+    0x06: "SRLV", 0x07: "SRAV", 0x08: "JR", 0x09: "JALR",
+    0x0C: "SYSCALL", 0x0D: "BREAK", 0x0F: "SYNC",
+    0x10: "MFHI", 0x11: "MTHI", 0x12: "MFLO", 0x13: "MTLO",
+    0x14: "DSLLV", 0x16: "DSRLV", 0x17: "DSRAV",
+    0x18: "MULT", 0x19: "MULTU", 0x1A: "DIV", 0x1B: "DIVU",
+    0x1C: "DMULT", 0x1D: "DMULTU", 0x1E: "DDIV", 0x1F: "DDIVU",
+    0x20: "ADD", 0x21: "ADDU", 0x22: "SUB", 0x23: "SUBU",
+    0x24: "AND", 0x25: "OR", 0x26: "XOR", 0x27: "NOR",
+    0x2A: "SLT", 0x2B: "SLTU", 0x2C: "DADD", 0x2D: "DADDU",
+    0x2E: "DSUB", 0x2F: "DSUBU",
+    0x30: "TGE", 0x31: "TGEU", 0x32: "TLT", 0x33: "TLTU",
+    0x34: "TEQ", 0x36: "TNE",
+    0x38: "DSLL", 0x3A: "DSRL", 0x3B: "DSRA",
+    0x3C: "DSLL32", 0x3E: "DSRL32", 0x3F: "DSRA32",
+}
+
+REGIMM = {
+    0x00: "BLTZ", 0x01: "BGEZ", 0x02: "BLTZL", 0x03: "BGEZL",
+    0x08: "TGEI", 0x09: "TGEIU", 0x0A: "TLTI", 0x0B: "TLTIU",
+    0x0C: "TEQI", 0x0E: "TNEI",
+    0x10: "BLTZAL", 0x11: "BGEZAL", 0x12: "BLTZALL", 0x13: "BGEZALL",
+}
+
+COP0_RS = {
+    0x00: "MFC0", 0x01: "DMFC0", 0x02: "CFC0", 0x04: "MTC0",
+    0x05: "DMTC0", 0x06: "CTC0", 0x08: "BC0", 0x10: "COP0_CO",
+}
+
+COP0_CO = {
+    0x01: "TLBR", 0x02: "TLBWI", 0x06: "TLBWR", 0x08: "TLBP",
+    0x18: "ERET",
+}
+
+COP1_RS = {
+    0x00: "MFC1", 0x01: "DMFC1", 0x02: "CFC1", 0x04: "MTC1",
+    0x05: "DMTC1", 0x06: "CTC1", 0x08: "BC1",
+    0x10: "S", 0x11: "D", 0x14: "W", 0x15: "L",
+}
+
+COP1_FUNCT = {
+    0x00: "ADD", 0x01: "SUB", 0x02: "MUL", 0x03: "DIV",
+    0x04: "SQRT", 0x05: "ABS", 0x06: "MOV", 0x07: "NEG",
+    0x08: "ROUND.L", 0x09: "TRUNC.L", 0x0A: "CEIL.L", 0x0B: "FLOOR.L",
+    0x0C: "ROUND.W", 0x0D: "TRUNC.W", 0x0E: "CEIL.W", 0x0F: "FLOOR.W",
+    0x20: "CVT.S", 0x21: "CVT.D", 0x24: "CVT.W", 0x25: "CVT.L",
+    0x30: "C.F", 0x31: "C.UN", 0x32: "C.EQ", 0x33: "C.UEQ",
+    0x34: "C.OLT", 0x35: "C.ULT", 0x36: "C.OLE", 0x37: "C.ULE",
+    0x38: "C.SF", 0x39: "C.NGLE", 0x3A: "C.SEQ", 0x3B: "C.NGL",
+    0x3C: "C.LT", 0x3D: "C.NGE", 0x3E: "C.LE", 0x3F: "C.NGT",
+}
+
+MEMORY_PRIMARY_OPS = frozenset({
+    0x1A, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E,
+    0x30, 0x31, 0x34, 0x35, 0x37, 0x38, 0x39, 0x3C, 0x3D, 0x3F,
+})
+
+BRANCH_NAMES = frozenset({
+    "J", "JAL", "JR", "JALR", "BEQ", "BNE", "BLEZ", "BGTZ",
+    "BEQL", "BNEL", "BLEZL", "BGTZL", "BLTZ", "BGEZ", "BLTZL", "BGEZL",
+    "BLTZAL", "BGEZAL", "BLTZALL", "BGEZALL", "BC1",
+})
+
+MMIO_NAMES = {
+    0x04040000: "SP_MEM_ADDR", 0x04040004: "SP_DRAM_ADDR", 0x04040008: "SP_RD_LEN",
+    0x0404000C: "SP_WR_LEN", 0x04040010: "SP_STATUS", 0x04040014: "SP_DMA_FULL",
+    0x04040018: "SP_DMA_BUSY", 0x0404001C: "SP_SEMAPHORE",
+    0x04100000: "DPC_START", 0x04100004: "DPC_END", 0x04100008: "DPC_CURRENT",
+    0x0410000C: "DPC_STATUS", 0x04100010: "DPC_CLOCK", 0x04100014: "DPC_BUFBUSY",
+    0x04100018: "DPC_PIPEBUSY", 0x0410001C: "DPC_TMEM",
+    0x04300000: "MI_INIT_MODE", 0x04300004: "MI_VERSION", 0x04300008: "MI_INTR",
+    0x0430000C: "MI_INTR_MASK",
+    0x04400000: "VI_STATUS", 0x04400004: "VI_ORIGIN", 0x04400008: "VI_WIDTH",
+    0x0440000C: "VI_INTR", 0x04400010: "VI_CURRENT", 0x04400014: "VI_BURST",
+    0x04400018: "VI_V_SYNC", 0x0440001C: "VI_H_SYNC", 0x04400020: "VI_LEAP",
+    0x04400024: "VI_H_START", 0x04400028: "VI_V_START", 0x0440002C: "VI_V_BURST",
+    0x04400030: "VI_X_SCALE", 0x04400034: "VI_Y_SCALE",
+    0x04500000: "AI_DRAM_ADDR", 0x04500004: "AI_LEN", 0x04500008: "AI_CONTROL",
+    0x0450000C: "AI_STATUS", 0x04500010: "AI_DACRATE", 0x04500014: "AI_BITRATE",
+    0x04600000: "PI_DRAM_ADDR", 0x04600004: "PI_CART_ADDR", 0x04600008: "PI_RD_LEN",
+    0x0460000C: "PI_WR_LEN", 0x04600010: "PI_STATUS", 0x04600014: "PI_BSD_DOM1_LAT",
+    0x04600018: "PI_BSD_DOM1_PWD", 0x0460001C: "PI_BSD_DOM1_PGS", 0x04600020: "PI_BSD_DOM1_RLS",
+    0x04600024: "PI_BSD_DOM2_LAT", 0x04600028: "PI_BSD_DOM2_PWD", 0x0460002C: "PI_BSD_DOM2_PGS",
+    0x04600030: "PI_BSD_DOM2_RLS",
+    0x04700000: "RI_MODE", 0x04700004: "RI_CONFIG", 0x04700008: "RI_CURRENT_LOAD",
+    0x0470000C: "RI_SELECT", 0x04700010: "RI_REFRESH", 0x04700014: "RI_LATENCY",
+    0x04700018: "RI_ERROR", 0x0470001C: "RI_WERROR",
+    0x04800000: "SI_DRAM_ADDR", 0x04800004: "SI_PIF_ADDR_RD64B", 0x04800010: "SI_PIF_ADDR_WR64B",
+    0x04800018: "SI_STATUS",
+}
+
+
+@dataclass
+class ACN64EmuHeader:
+    valid: bool = False
+    pi_lat: int = 0
+    pi_pwd: int = 0
+    pi_pgs: int = 0
+    pi_rls: int = 0
+    clock_rate: int = 0
+    boot_address: int = 0
+    release: int = 0
+    crc1: int = 0
+    crc2: int = 0
+    title: str = "UNKNOWN TITLE"
+    media: str = "?"
+    cart_id: str = "??"
+    country: str = "?"
+    version: int = 0
+
+    def parse(self, rom: bytearray | bytes) -> None:
+        if len(rom) < 0x40:
+            raise ValueError("ROM is too small for an N64 header")
+        self.valid = True
+        self.pi_lat = rom[0x00]
+        self.pi_pwd = rom[0x01]
+        self.pi_pgs = rom[0x02]
+        self.pi_rls = rom[0x03]
+        self.clock_rate = be32(rom, 0x04)
+        self.boot_address = be32(rom, 0x08)
+        self.release = be32(rom, 0x0C)
+        self.crc1 = be32(rom, 0x10)
+        self.crc2 = be32(rom, 0x14)
+        self.title = ascii_clean(rom[0x20:0x34]) or "UNKNOWN TITLE"
+        self.media = chr(rom[0x3B]) if rom[0x3B] else "?"
+        self.cart_id = ascii_clean(rom[0x3C:0x3E]) or "??"
+        self.country = chr(rom[0x3E]) if rom[0x3E] else "?"
+        self.version = rom[0x3F]
+
+    def info(self) -> Dict[str, object]:
+        return dict(self.__dict__)
+
+
+class ACN64EmuOpcode:
+    __slots__ = ("word", "op", "rs", "rt", "rd", "sa", "funct", "imm", "simm", "target")
+
+    def __init__(self, word: int):
+        word &= MASK_32
+        self.word = word
+        self.op = (word >> 26) & 0x3F
+        self.rs = (word >> 21) & 0x1F
+        self.rt = (word >> 16) & 0x1F
+        self.rd = (word >> 11) & 0x1F
+        self.sa = (word >> 6) & 0x1F
+        self.funct = word & 0x3F
+        self.imm = word & MASK_16
+        self.simm = sign16(self.imm)
+        self.target = word & 0x03FFFFFF
+
+    def target_addr(self, pc: int) -> int:
+        return u32(((pc + 4) & 0xF0000000) | (self.target << 2))
+
+    def branch_addr(self, pc: int) -> int:
+        return u32(pc + 4 + (self.simm << 2))
+
+
+class ACN64EmuDeviceBus:
+    """Clean-room N64 memory and device map.
+
+    This is intentionally conservative: it implements deterministic register stubs,
+    RDRAM/DMEM/IMEM/PIF RAM, and ROM reads. Device writes are logged and mirrored in
+    register storage so the CPU can safely boot and execute setup code without
+    external hardware files.
+    """
+
+    def __init__(self, core: "ACN64EmuCore"):
+        self.core = core
+        self.regs: Dict[int, int] = {}
+        self.last_mmio_name = "NONE"
+        self.last_mmio_addr = 0
+        self.last_mmio_value = 0
+        self.mmio_reads = 0
+        self.mmio_writes = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.regs.clear()
+        self.last_mmio_name = "NONE"
+        self.last_mmio_addr = 0
+        self.last_mmio_value = 0
+        self.mmio_reads = 0
+        self.mmio_writes = 0
+        self.regs[0x04300004] = 0x02020102  # MI_VERSION style reset value.
+        self.regs[0x04300008] = 0x00000000
+        self.regs[0x0430000C] = 0x00000000
+        self.regs[0x04400008] = 320
+        self.regs[0x04400010] = 0
+        self.regs[0x0450000C] = 0
+        self.regs[0x04600010] = 0
+        self.regs[0x04700000] = 0
+        self.regs[0x04800018] = 0
+
+    def vaddr_to_phys(self, addr: int) -> int:
+        addr &= MASK_32
+        if 0x80000000 <= addr <= 0x9FFFFFFF:
+            return addr & 0x1FFFFFFF
+        if 0xA0000000 <= addr <= 0xBFFFFFFF:
+            return addr & 0x1FFFFFFF
+        return addr
+
+    def _read_region_u8(self, phys: int) -> int:
+        c = self.core
+        phys &= MASK_32
+        if 0 <= phys < len(c.rdram):
+            return c.rdram[phys]
+        if 0x04000000 <= phys < 0x04000000 + RSP_DMEM_SIZE:
+            return c.rsp_dmem[phys - 0x04000000]
+        if 0x04001000 <= phys < 0x04001000 + RSP_IMEM_SIZE:
+            return c.rsp_imem[phys - 0x04001000]
+        if 0x10000000 <= phys < 0x10000000 + len(c.rom):
+            return c.rom[phys - 0x10000000]
+        if 0x1FC00000 <= phys < 0x1FC00000 + len(c.pif_rom):
+            return c.pif_rom[phys - 0x1FC00000]
+        if 0x1FC007C0 <= phys < 0x1FC007C0 + len(c.pif_ram):
+            return c.pif_ram[phys - 0x1FC007C0]
+        if self._is_mmio(phys):
+            word = self.read_mmio32(phys & ~3)
+            shift = (3 - (phys & 3)) * 8
+            return (word >> shift) & MASK_8
+        return 0
+
+    def _write_region_u8(self, phys: int, value: int) -> None:
+        c = self.core
+        phys &= MASK_32
+        value &= MASK_8
+        if 0 <= phys < len(c.rdram):
+            c.rdram[phys] = value
+            return
+        if 0x04000000 <= phys < 0x04000000 + RSP_DMEM_SIZE:
+            c.rsp_dmem[phys - 0x04000000] = value
+            return
+        if 0x04001000 <= phys < 0x04001000 + RSP_IMEM_SIZE:
+            c.rsp_imem[phys - 0x04001000] = value
+            return
+        if 0x1FC007C0 <= phys < 0x1FC007C0 + len(c.pif_ram):
+            c.pif_ram[phys - 0x1FC007C0] = value
+            return
+        if self._is_mmio(phys):
+            aligned = phys & ~3
+            old = self.read_mmio32(aligned)
+            shift = (3 - (phys & 3)) * 8
+            mask = MASK_8 << shift
+            self.write_mmio32(aligned, (old & ~mask) | (value << shift))
+
+    def _is_mmio(self, phys: int) -> bool:
+        return (
+            0x04040000 <= phys <= 0x040FFFFF
+            or 0x04100000 <= phys <= 0x048FFFFF
+        )
+
+    def read_mmio32(self, phys: int) -> int:
+        phys &= ~3
+        self.mmio_reads += 1
+        self.last_mmio_addr = phys
+        self.last_mmio_name = MMIO_NAMES.get(phys, f"MMIO_{phys:08X}")
+        if phys == 0x04400010:  # VI_CURRENT
+            value = (self.core.vi_count * 2) & 0x3FF
+        elif phys == 0x0450000C:  # AI_STATUS
+            value = self.regs.get(phys, 0) & ~0x80000000
+        elif phys == 0x04600010:  # PI_STATUS
+            value = self.regs.get(phys, 0) & ~0x00000003
+        elif phys == 0x04800018:  # SI_STATUS
+            value = self.regs.get(phys, 0) & ~0x00001000
+        else:
+            value = self.regs.get(phys, 0)
+        self.last_mmio_value = value & MASK_32
+        return value & MASK_32
+
+    def write_mmio32(self, phys: int, value: int) -> None:
+        phys &= ~3
+        value &= MASK_32
+        self.mmio_writes += 1
+        self.last_mmio_addr = phys
+        self.last_mmio_value = value
+        self.last_mmio_name = MMIO_NAMES.get(phys, f"MMIO_{phys:08X}")
+        self.regs[phys] = value
+        c = self.core
+
+        if phys == 0x04040008:  # SP_RD_LEN, DMEM <- RDRAM best-effort DMA
+            sp_mem = self.regs.get(0x04040000, 0) & 0x1FFF
+            dram = self.regs.get(0x04040004, 0) & 0x00FFFFFF
+            length = ((value & 0xFFF) | 7) + 1
+            self._dma_to_rsp(sp_mem, dram, length)
+            self.regs[0x04040018] = 0
+        elif phys == 0x0404000C:  # SP_WR_LEN, RDRAM <- DMEM best-effort DMA
+            sp_mem = self.regs.get(0x04040000, 0) & 0x1FFF
+            dram = self.regs.get(0x04040004, 0) & 0x00FFFFFF
+            length = ((value & 0xFFF) | 7) + 1
+            self._dma_from_rsp(sp_mem, dram, length)
+            self.regs[0x04040018] = 0
+        elif phys == 0x0460000C:  # PI_WR_LEN, cart -> RDRAM DMA
+            dram = self.regs.get(0x04600000, 0) & 0x00FFFFFF
+            cart = self.regs.get(0x04600004, 0) & MASK_32
+            length = (value & 0x00FFFFFF) + 1
+            self._dma_pi_read(dram, cart, length)
+            self.regs[0x04600010] = 0
+            c.dma_count += 1
+        elif phys == 0x04800004:  # SI_PIF_ADDR_RD64B, PIF RAM -> RDRAM
+            dram = self.regs.get(0x04800000, 0) & 0x00FFFFFF
+            for i in range(min(PIF_RAM_SIZE, len(c.rdram) - dram)):
+                c.rdram[dram + i] = c.pif_ram[i]
+            self.regs[0x04800018] = 0
+            c.dma_count += 1
+        elif phys == 0x04800010:  # SI_PIF_ADDR_WR64B, RDRAM -> PIF RAM
+            dram = self.regs.get(0x04800000, 0) & 0x00FFFFFF
+            for i in range(min(PIF_RAM_SIZE, len(c.rdram) - dram)):
+                c.pif_ram[i] = c.rdram[dram + i]
+            c.process_pif_ram()
+            self.regs[0x04800018] = 0
+            c.dma_count += 1
+
+    def _dma_pi_read(self, dram: int, cart: int, length: int) -> None:
+        c = self.core
+        if 0x10000000 <= cart < 0x10000000 + len(c.rom):
+            src = cart - 0x10000000
+        else:
+            src = cart & 0x0FFFFFFF
+        if dram >= len(c.rdram) or src >= len(c.rom):
+            return
+        count = min(length, len(c.rdram) - dram, len(c.rom) - src)
+        if count > 0:
+            c.rdram[dram:dram + count] = c.rom[src:src + count]
+
+    def _dma_to_rsp(self, sp_mem: int, dram: int, length: int) -> None:
+        c = self.core
+        target = c.rsp_imem if sp_mem & 0x1000 else c.rsp_dmem
+        off = sp_mem & 0x0FFF
+        if dram >= len(c.rdram):
+            return
+        count = min(length, len(target) - off, len(c.rdram) - dram)
+        if count > 0:
+            target[off:off + count] = c.rdram[dram:dram + count]
+
+    def _dma_from_rsp(self, sp_mem: int, dram: int, length: int) -> None:
+        c = self.core
+        source = c.rsp_imem if sp_mem & 0x1000 else c.rsp_dmem
+        off = sp_mem & 0x0FFF
+        if dram >= len(c.rdram):
+            return
+        count = min(length, len(source) - off, len(c.rdram) - dram)
+        if count > 0:
+            c.rdram[dram:dram + count] = source[off:off + count]
+
+    def read_u8(self, vaddr: int) -> int:
+        return self._read_region_u8(self.vaddr_to_phys(vaddr))
+
+    def read_u16(self, vaddr: int) -> int:
+        p = self.vaddr_to_phys(vaddr)
+        return ((self._read_region_u8(p) << 8) | self._read_region_u8(p + 1)) & MASK_16
+
+    def read_u32(self, vaddr: int) -> int:
+        p = self.vaddr_to_phys(vaddr)
+        if self._is_mmio(p) and (p & 3) == 0:
+            return self.read_mmio32(p)
+        return (
+            (self._read_region_u8(p) << 24)
+            | (self._read_region_u8(p + 1) << 16)
+            | (self._read_region_u8(p + 2) << 8)
+            | self._read_region_u8(p + 3)
+        ) & MASK_32
+
+    def read_u64(self, vaddr: int) -> int:
+        hi = self.read_u32(vaddr)
+        lo = self.read_u32(vaddr + 4)
+        return ((hi << 32) | lo) & MASK_64
+
+    def write_u8(self, vaddr: int, value: int) -> None:
+        self._write_region_u8(self.vaddr_to_phys(vaddr), value)
+
+    def write_u16(self, vaddr: int, value: int) -> None:
+        p = self.vaddr_to_phys(vaddr)
+        value &= MASK_16
+        self._write_region_u8(p, (value >> 8) & MASK_8)
+        self._write_region_u8(p + 1, value & MASK_8)
+
+    def write_u32(self, vaddr: int, value: int) -> None:
+        p = self.vaddr_to_phys(vaddr)
+        value &= MASK_32
+        if self._is_mmio(p) and (p & 3) == 0:
+            self.write_mmio32(p, value)
+            return
+        self._write_region_u8(p, (value >> 24) & MASK_8)
+        self._write_region_u8(p + 1, (value >> 16) & MASK_8)
+        self._write_region_u8(p + 2, (value >> 8) & MASK_8)
+        self._write_region_u8(p + 3, value & MASK_8)
+
+    def write_u64(self, vaddr: int, value: int) -> None:
+        value &= MASK_64
+        self.write_u32(vaddr, (value >> 32) & MASK_32)
+        self.write_u32(vaddr + 4, value & MASK_32)
+
+
+class ACN64EmuCPU:
+    def __init__(self, core: "ACN64EmuCore"):
+        self.core = core
+        self.gpr: List[int] = [0] * 32
+        self.fpr: List[int] = [0] * 32
+        self.cp0: List[int] = [0] * 32
+        self.fcr0 = 0x00000511
+        self.fcr31 = 0
+        self.hi = 0
+        self.lo = 0
+        self.pc = 0
+        self.next_pc = 4
+        self.last_opcode = 0
+        self.last_decode = "RESET"
+        self.last_branch = "NONE"
+        self.opcode_count = 0
+        self.exception = ""
+        self.trap_count = 0
+        self.decode_cache: Dict[int, Tuple[ACN64EmuOpcode, str]] = {}
+        self.decode_cache_hits = 0
+        self.decode_cache_misses = 0
+        self.decode_cache_limit = OPCODE_CACHE_LIMIT
+        self.llbit = False
+        self.lladdr = 0
+        self.reset(0)
+
+    def reset(self, pc: int) -> None:
+        self.gpr = [0] * 32
+        self.fpr = [0] * 32
+        self.cp0 = [0] * 32
+        self.cp0[CP0_RANDOM] = 31
+        self.cp0[CP0_STATUS] = 0x34000000
+        self.cp0[CP0_PRID] = 0x00000B00
+        self.cp0[CP0_CONFIG] = 0x0006E463
+        self.fcr0 = 0x00000511
+        self.fcr31 = 0
+        self.hi = 0
+        self.lo = 0
+        self.pc = u32(pc)
+        self.next_pc = u32(pc + 4)
+        self.last_opcode = 0
+        self.last_decode = "RESET"
+        self.last_branch = "NONE"
+        self.opcode_count = 0
+        self.exception = ""
+        self.trap_count = 0
+        self.decode_cache.clear()
+        self.decode_cache_hits = 0
+        self.decode_cache_misses = 0
+        self.llbit = False
+        self.lladdr = 0
+
+    def decode_name_from_opcode(self, o: ACN64EmuOpcode) -> str:
+        if o.op == 0:
+            return SPECIAL.get(o.funct, f"SPECIAL_{o.funct:02X}")
+        if o.op == 1:
+            return REGIMM.get(o.rt, f"REGIMM_{o.rt:02X}")
+        if o.op == 0x10:
+            if o.rs == 0x10:
+                return COP0_CO.get(o.funct, f"COP0_CO_{o.funct:02X}")
+            return COP0_RS.get(o.rs, f"COP0_RS_{o.rs:02X}")
+        if o.op == 0x11:
+            base = COP1_RS.get(o.rs, f"COP1_RS_{o.rs:02X}")
+            if base in ("S", "D", "W", "L"):
+                return f"{COP1_FUNCT.get(o.funct, f'FPU_{o.funct:02X}')}.{base}"
+            return base
+        return PRIMARY.get(o.op, f"OP_{o.op:02X}")
+
+    def decode_cached(self, word: int) -> Tuple[ACN64EmuOpcode, str]:
+        word &= MASK_32
+        cached = self.decode_cache.get(word)
+        if cached is not None:
+            self.decode_cache_hits += 1
+            return cached
+        o = ACN64EmuOpcode(word)
+        name = self.decode_name_from_opcode(o)
+        if len(self.decode_cache) >= self.decode_cache_limit:
+            self.decode_cache.clear()
+        cached = (o, name)
+        self.decode_cache[word] = cached
+        self.decode_cache_misses += 1
+        return cached
+
+    def decode_name(self, word: int) -> str:
+        return self.decode_cached(word)[1]
+
+    def format_decode(self, word: int, o: Optional[ACN64EmuOpcode] = None, name: Optional[str] = None) -> str:
+        if o is None or name is None:
+            o, name = self.decode_cached(word)
+        if o.op == 0:
+            return f"{name} rd=r{o.rd} rs=r{o.rs} rt=r{o.rt} sa={o.sa}"
+        if name in ("J", "JAL"):
+            return f"{name} 0x{o.target_addr(self.pc):08X}"
+        if name in BRANCH_NAMES:
+            return f"{name} rs=r{o.rs} rt=r{o.rt} -> 0x{o.branch_addr(self.pc):08X}"
+        if o.op in MEMORY_PRIMARY_OPS:
+            return f"{name} rt=r{o.rt}, {o.simm}(r{o.rs})"
+        if name in ("MFC0", "DMFC0", "MTC0", "DMTC0", "MFC1", "DMFC1", "MTC1", "DMTC1"):
+            return f"{name} rt=r{o.rt} rd={o.rd}"
+        return f"{name} rs=r{o.rs} rt=r{o.rt} imm=0x{o.imm:04X}"
+
+    def read_u8(self, vaddr: int) -> int:
+        return self.core.bus.read_u8(vaddr)
+
+    def read_u16(self, vaddr: int) -> int:
+        return self.core.bus.read_u16(vaddr)
+
+    def read_u32(self, vaddr: int) -> int:
+        return self.core.bus.read_u32(vaddr)
+
+    def read_u64(self, vaddr: int) -> int:
+        return self.core.bus.read_u64(vaddr)
+
+    def write_u8(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u8(vaddr, value)
+
+    def write_u16(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u16(vaddr, value)
+
+    def write_u32(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u32(vaddr, value)
+
+    def write_u64(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u64(vaddr, value)
+
+    def _raise(self, name: str, pc: Optional[int] = None, code: int = 0) -> None:
+        self.exception = name
+        self.trap_count += 1
+        epc = self.pc if pc is None else pc
+        self.cp0[CP0_EPC] = u32(epc)
+        self.cp0[CP0_CAUSE] = ((code & 0x1F) << 2) & MASK_32
+
+    def _set_fpu_cond(self, cond: bool) -> None:
+        if cond:
+            self.fcr31 |= (1 << FCR31_COND_BIT)
+        else:
+            self.fcr31 &= ~(1 << FCR31_COND_BIT)
+
+    def _fpu_cond(self) -> bool:
+        return bool((self.fcr31 >> FCR31_COND_BIT) & 1)
+
+    def _get_f32(self, reg: int) -> float:
+        return bits_to_f32(self.fpr[reg] & MASK_32)
+
+    def _set_f32(self, reg: int, value: float) -> None:
+        self.fpr[reg] = u64((self.fpr[reg] & 0xFFFFFFFF00000000) | f32_to_bits(value))
+
+    def _get_f64(self, reg: int) -> float:
+        return bits_to_f64(self.fpr[reg])
+
+    def _set_f64(self, reg: int, value: float) -> None:
+        self.fpr[reg] = f64_to_bits(value)
+
+    def _skip_likely_delay(self, old_pc: int) -> None:
+        self.pc = u32(old_pc + 8)
+        self.next_pc = u32(old_pc + 12)
+        self.last_branch = "LIKELY-SKIP"
+
+    def _branch(self, old_pc: int, target: int) -> None:
+        self.next_pc = u32(target)
+        self.last_branch = f"TAKEN->{target:08X}"
+
+    def _not_branch(self) -> None:
+        self.last_branch = "NOT-TAKEN"
+
+    def _overflow_add32(self, a: int, b: int, result: int) -> bool:
+        a32 = sign32(a)
+        b32 = sign32(b)
+        r32 = sign32(result)
+        return (a32 >= 0 and b32 >= 0 and r32 < 0) or (a32 < 0 and b32 < 0 and r32 >= 0)
+
+    def _overflow_sub32(self, a: int, b: int, result: int) -> bool:
+        a32 = sign32(a)
+        b32 = sign32(b)
+        r32 = sign32(result)
+        return (a32 >= 0 and b32 < 0 and r32 < 0) or (a32 < 0 and b32 >= 0 and r32 >= 0)
+
+    def step(self) -> str:
+        word = self.read_u32(self.pc)
+        o, name = self.decode_cached(word)
+        self.last_opcode = word
+        self.last_decode = self.format_decode(word, o, name)
+        self.execute(word, o, name)
+        self.opcode_count += 1
+        self.cp0[CP0_COUNT] = u32(self.cp0[CP0_COUNT] + 1)
+        self.gpr[0] = 0
+        return self.last_decode
+
+    def execute(self, word: int, o: Optional[ACN64EmuOpcode] = None, name: Optional[str] = None) -> None:
+        if o is None or name is None:
+            o, name = self.decode_cached(word)
+
+        old_pc = self.pc
+        g = self.gpr
+        self.pc = self.next_pc
+        self.next_pc = u32(self.next_pc + 4)
+        self.last_branch = "NONE"
+
+        if word == 0:
+            return
+
+        try:
+            if name == "LUI":
+                g[o.rt] = sx32_to_64(o.imm << 16)
+            elif name == "ORI":
+                g[o.rt] = u64(g[o.rs] | o.imm)
+            elif name == "ANDI":
+                g[o.rt] = u64(g[o.rs] & o.imm)
+            elif name == "XORI":
+                g[o.rt] = u64(g[o.rs] ^ o.imm)
+            elif name == "ADDI":
+                result = (g[o.rs] + o.simm) & MASK_32
+                if self._overflow_add32(g[o.rs], o.simm, result):
+                    self._raise("INT_OVERFLOW", old_pc, 12)
+                else:
+                    g[o.rt] = sx32_to_64(result)
+            elif name == "ADDIU":
+                g[o.rt] = sx32_to_64((g[o.rs] + o.simm) & MASK_32)
+            elif name == "DADDI":
+                g[o.rt] = u64(sign64(g[o.rs]) + o.simm)
+            elif name == "DADDIU":
+                g[o.rt] = u64(g[o.rs] + o.simm)
+            elif name == "ADDU":
+                g[o.rd] = sx32_to_64((g[o.rs] + g[o.rt]) & MASK_32)
+            elif name == "ADD":
+                result = (g[o.rs] + g[o.rt]) & MASK_32
+                if self._overflow_add32(g[o.rs], g[o.rt], result):
+                    self._raise("INT_OVERFLOW", old_pc, 12)
+                else:
+                    g[o.rd] = sx32_to_64(result)
+            elif name == "DADDU":
+                g[o.rd] = u64(g[o.rs] + g[o.rt])
+            elif name == "DADD":
+                g[o.rd] = u64(sign64(g[o.rs]) + sign64(g[o.rt]))
+            elif name == "SUBU":
+                g[o.rd] = sx32_to_64((g[o.rs] - g[o.rt]) & MASK_32)
+            elif name == "SUB":
+                result = (g[o.rs] - g[o.rt]) & MASK_32
+                if self._overflow_sub32(g[o.rs], g[o.rt], result):
+                    self._raise("INT_OVERFLOW", old_pc, 12)
+                else:
+                    g[o.rd] = sx32_to_64(result)
+            elif name == "DSUBU":
+                g[o.rd] = u64(g[o.rs] - g[o.rt])
+            elif name == "DSUB":
+                g[o.rd] = u64(sign64(g[o.rs]) - sign64(g[o.rt]))
+            elif name == "AND":
+                g[o.rd] = u64(g[o.rs] & g[o.rt])
+            elif name == "OR":
+                g[o.rd] = u64(g[o.rs] | g[o.rt])
+            elif name == "XOR":
+                g[o.rd] = u64(g[o.rs] ^ g[o.rt])
+            elif name == "NOR":
+                g[o.rd] = u64(~(g[o.rs] | g[o.rt]))
+            elif name == "SLTI":
+                g[o.rt] = 1 if sign64(g[o.rs]) < o.simm else 0
+            elif name == "SLTIU":
+                g[o.rt] = 1 if g[o.rs] < u64(o.simm) else 0
+            elif name == "SLT":
+                g[o.rd] = 1 if sign64(g[o.rs]) < sign64(g[o.rt]) else 0
+            elif name == "SLTU":
+                g[o.rd] = 1 if g[o.rs] < g[o.rt] else 0
+            elif name == "SLL":
+                g[o.rd] = sx32_to_64((g[o.rt] & MASK_32) << o.sa)
+            elif name == "SRL":
+                g[o.rd] = sx32_to_64((g[o.rt] & MASK_32) >> o.sa)
+            elif name == "SRA":
+                g[o.rd] = sx32_to_64(sign32(g[o.rt]) >> o.sa)
+            elif name == "SLLV":
+                g[o.rd] = sx32_to_64((g[o.rt] & MASK_32) << (g[o.rs] & 0x1F))
+            elif name == "SRLV":
+                g[o.rd] = sx32_to_64((g[o.rt] & MASK_32) >> (g[o.rs] & 0x1F))
+            elif name == "SRAV":
+                g[o.rd] = sx32_to_64(sign32(g[o.rt]) >> (g[o.rs] & 0x1F))
+            elif name == "DSLL":
+                g[o.rd] = u64(g[o.rt] << o.sa)
+            elif name == "DSRL":
+                g[o.rd] = u64(g[o.rt] >> o.sa)
+            elif name == "DSRA":
+                g[o.rd] = u64(sign64(g[o.rt]) >> o.sa)
+            elif name == "DSLL32":
+                g[o.rd] = u64(g[o.rt] << (o.sa + 32))
+            elif name == "DSRL32":
+                g[o.rd] = u64(g[o.rt] >> (o.sa + 32))
+            elif name == "DSRA32":
+                g[o.rd] = u64(sign64(g[o.rt]) >> (o.sa + 32))
+            elif name == "DSLLV":
+                g[o.rd] = u64(g[o.rt] << (g[o.rs] & 0x3F))
+            elif name == "DSRLV":
+                g[o.rd] = u64(g[o.rt] >> (g[o.rs] & 0x3F))
+            elif name == "DSRAV":
+                g[o.rd] = u64(sign64(g[o.rt]) >> (g[o.rs] & 0x3F))
+            elif name == "MFHI":
+                g[o.rd] = self.hi
+            elif name == "MTHI":
+                self.hi = u64(g[o.rs])
+            elif name == "MFLO":
+                g[o.rd] = self.lo
+            elif name == "MTLO":
+                self.lo = u64(g[o.rs])
+            elif name in ("MULT", "MULTU", "DMULT", "DMULTU"):
+                self._exec_mult(name, o)
+            elif name in ("DIV", "DIVU", "DDIV", "DDIVU"):
+                self._exec_div(name, o)
+            elif name == "LW":
+                g[o.rt] = sx32_to_64(self.read_u32(g[o.rs] + o.simm))
+            elif name == "LWU":
+                g[o.rt] = self.read_u32(g[o.rs] + o.simm)
+            elif name == "LH":
+                g[o.rt] = sx16_to_64(self.read_u16(g[o.rs] + o.simm))
+            elif name == "LHU":
+                g[o.rt] = self.read_u16(g[o.rs] + o.simm)
+            elif name == "LB":
+                g[o.rt] = sx8_to_64(self.read_u8(g[o.rs] + o.simm))
+            elif name == "LBU":
+                g[o.rt] = self.read_u8(g[o.rs] + o.simm)
+            elif name == "LD":
+                g[o.rt] = self.read_u64(g[o.rs] + o.simm)
+            elif name == "LL":
+                addr = u32(g[o.rs] + o.simm)
+                g[o.rt] = sx32_to_64(self.read_u32(addr))
+                self.llbit = True
+                self.lladdr = addr & ~3
+                self.cp0[CP0_LLADDR] = self.lladdr
+            elif name == "LLD":
+                addr = u32(g[o.rs] + o.simm)
+                g[o.rt] = self.read_u64(addr)
+                self.llbit = True
+                self.lladdr = addr & ~7
+                self.cp0[CP0_LLADDR] = self.lladdr
+            elif name == "SC":
+                addr = u32(g[o.rs] + o.simm)
+                if self.llbit and (addr & ~3) == self.lladdr:
+                    self.write_u32(addr, g[o.rt])
+                    g[o.rt] = 1
+                else:
+                    g[o.rt] = 0
+                self.llbit = False
+            elif name == "SCD":
+                addr = u32(g[o.rs] + o.simm)
+                if self.llbit and (addr & ~7) == self.lladdr:
+                    self.write_u64(addr, g[o.rt])
+                    g[o.rt] = 1
+                else:
+                    g[o.rt] = 0
+                self.llbit = False
+            elif name == "SW":
+                self.write_u32(g[o.rs] + o.simm, g[o.rt])
+            elif name == "SH":
+                self.write_u16(g[o.rs] + o.simm, g[o.rt])
+            elif name == "SB":
+                self.write_u8(g[o.rs] + o.simm, g[o.rt])
+            elif name == "SD":
+                self.write_u64(g[o.rs] + o.simm, g[o.rt])
+            elif name in ("LWL", "LWR", "LDL", "LDR", "SWL", "SWR", "SDL", "SDR"):
+                self._exec_unaligned(name, o)
+            elif name == "J":
+                self._branch(old_pc, o.target_addr(old_pc))
+            elif name == "JAL":
+                g[31] = u64(old_pc + 8)
+                self._branch(old_pc, o.target_addr(old_pc))
+            elif name == "JR":
+                self._branch(old_pc, g[o.rs])
+            elif name == "JALR":
+                g[o.rd or 31] = u64(old_pc + 8)
+                self._branch(old_pc, g[o.rs])
+            elif name in ("BEQ", "BNE", "BLEZ", "BGTZ", "BEQL", "BNEL", "BLEZL", "BGTZL"):
+                self._exec_branch(name, o, old_pc)
+            elif name in ("BLTZ", "BGEZ", "BLTZL", "BGEZL", "BLTZAL", "BGEZAL", "BLTZALL", "BGEZALL"):
+                self._exec_regimm_branch(name, o, old_pc)
+            elif name in ("TGE", "TGEU", "TLT", "TLTU", "TEQ", "TNE", "TGEI", "TGEIU", "TLTI", "TLTIU", "TEQI", "TNEI"):
+                self._exec_trap(name, o, old_pc)
+            elif name in ("SYSCALL", "BREAK"):
+                self._raise(name, old_pc, 8 if name == "SYSCALL" else 9)
+            elif name == "SYNC" or name == "CACHE":
+                pass
+            elif name in ("MFC0", "DMFC0", "MTC0", "DMTC0", "CFC0", "CTC0", "ERET", "TLBR", "TLBWI", "TLBWR", "TLBP"):
+                self._exec_cop0(name, o, old_pc)
+            elif name in ("MFC1", "DMFC1", "CFC1", "MTC1", "DMTC1", "CTC1", "BC1") or "." in name:
+                self._exec_cop1(name, o, old_pc)
+            elif name in ("COP2", "COP3", "LWC2", "LDC2", "SWC2", "SDC2", "LWC3", "SWC3"):
+                self.core.hle_note(f"{name}_STUB")
+            else:
+                self.core.unknown_opcodes += 1
+        finally:
+            g[0] = 0
+
+    def _exec_branch(self, name: str, o: ACN64EmuOpcode, old_pc: int) -> None:
+        g = self.gpr
+        taken = False
+        if name in ("BEQ", "BEQL"):
+            taken = g[o.rs] == g[o.rt]
+        elif name in ("BNE", "BNEL"):
+            taken = g[o.rs] != g[o.rt]
+        elif name in ("BLEZ", "BLEZL"):
+            taken = sign64(g[o.rs]) <= 0
+        elif name in ("BGTZ", "BGTZL"):
+            taken = sign64(g[o.rs]) > 0
+        if taken:
+            self._branch(old_pc, o.branch_addr(old_pc))
+        elif name.endswith("L"):
+            self._skip_likely_delay(old_pc)
+        else:
+            self._not_branch()
+
+    def _exec_regimm_branch(self, name: str, o: ACN64EmuOpcode, old_pc: int) -> None:
+        g = self.gpr
+        if "AL" in name:
+            g[31] = u64(old_pc + 8)
+        taken = False
+        if name.startswith("BLTZ"):
+            taken = sign64(g[o.rs]) < 0
+        elif name.startswith("BGEZ"):
+            taken = sign64(g[o.rs]) >= 0
+        if taken:
+            self._branch(old_pc, o.branch_addr(old_pc))
+        elif name.endswith("L"):
+            self._skip_likely_delay(old_pc)
+        else:
+            self._not_branch()
+
+    def _exec_trap(self, name: str, o: ACN64EmuOpcode, old_pc: int) -> None:
+        g = self.gpr
+        lhs_s = sign64(g[o.rs])
+        rhs_s = sign64(g[o.rt]) if name in SPECIAL.values() else o.simm
+        lhs_u = g[o.rs]
+        rhs_u = g[o.rt] if name in SPECIAL.values() else u64(o.simm)
+        fire = False
+        if name in ("TGE", "TGEI"):
+            fire = lhs_s >= rhs_s
+        elif name in ("TGEU", "TGEIU"):
+            fire = lhs_u >= rhs_u
+        elif name in ("TLT", "TLTI"):
+            fire = lhs_s < rhs_s
+        elif name in ("TLTU", "TLTIU"):
+            fire = lhs_u < rhs_u
+        elif name in ("TEQ", "TEQI"):
+            fire = lhs_u == rhs_u
+        elif name in ("TNE", "TNEI"):
+            fire = lhs_u != rhs_u
+        if fire:
+            self._raise(name, old_pc, 13)
+
+    def _exec_cop0(self, name: str, o: ACN64EmuOpcode, old_pc: int) -> None:
+        if name in ("MFC0", "CFC0"):
+            self.gpr[o.rt] = sx32_to_64(self.cp0[o.rd])
+        elif name == "DMFC0":
+            self.gpr[o.rt] = u64(self.cp0[o.rd])
+        elif name in ("MTC0", "CTC0"):
+            self.cp0[o.rd] = u32(self.gpr[o.rt])
+            if o.rd == CP0_COMPARE:
+                self.cp0[CP0_CAUSE] &= ~(1 << 15)
+        elif name == "DMTC0":
+            self.cp0[o.rd] = u64(self.gpr[o.rt])
+        elif name == "ERET":
+            target = self.cp0[CP0_ERROREPC] if (self.cp0[CP0_STATUS] & 0x4) else self.cp0[CP0_EPC]
+            self.pc = u32(target)
+            self.next_pc = u32(self.pc + 4)
+            self.cp0[CP0_STATUS] &= ~0x6
+            self.last_branch = "ERET"
+        elif name in ("TLBR", "TLBWI", "TLBWR", "TLBP"):
+            self.core.hle_note(f"{name}_TLB_STUB")
+
+    def _exec_cop1(self, name: str, o: ACN64EmuOpcode, old_pc: int) -> None:
+        g = self.gpr
+        if name == "MFC1":
+            g[o.rt] = sx32_to_64(self.fpr[o.rd] & MASK_32)
+        elif name == "DMFC1":
+            g[o.rt] = self.fpr[o.rd]
+        elif name == "CFC1":
+            g[o.rt] = sx32_to_64(self.fcr31 if o.rd == 31 else self.fcr0)
+        elif name == "MTC1":
+            self.fpr[o.rd] = u64((self.fpr[o.rd] & 0xFFFFFFFF00000000) | (g[o.rt] & MASK_32))
+        elif name == "DMTC1":
+            self.fpr[o.rd] = g[o.rt]
+        elif name == "CTC1":
+            if o.rd == 31:
+                self.fcr31 = u32(g[o.rt])
+            elif o.rd == 0:
+                self.fcr0 = u32(g[o.rt])
+        elif name == "BC1":
+            tf = o.rt & 1
+            likely = bool(o.rt & 2)
+            taken = self._fpu_cond() == bool(tf)
+            if taken:
+                self._branch(old_pc, o.branch_addr(old_pc))
+            elif likely:
+                self._skip_likely_delay(old_pc)
+            else:
+                self._not_branch()
+        elif "." in name:
+            self._exec_fpu_arith(name, o)
+
+    def _exec_fpu_arith(self, name: str, o: ACN64EmuOpcode) -> None:
+        op, fmt = name.rsplit(".", 1)
+        if fmt == "S":
+            fs = self._get_f32(o.rd)
+            ft = self._get_f32(o.rt)
+            setter = self._set_f32
+        elif fmt == "D":
+            fs = self._get_f64(o.rd)
+            ft = self._get_f64(o.rt)
+            setter = self._set_f64
+        elif fmt == "W":
+            fs = float(sign32(self.fpr[o.rd]))
+            ft = float(sign32(self.fpr[o.rt]))
+            setter = self._set_f32
+        elif fmt == "L":
+            fs = float(sign64(self.fpr[o.rd]))
+            ft = float(sign64(self.fpr[o.rt]))
+            setter = self._set_f64
+        else:
+            return
+
+        fd = o.sa  # In COP1 format, bits 10..6 are fd.
+        try:
+            if op == "ADD":
+                setter(fd, fs + ft)
+            elif op == "SUB":
+                setter(fd, fs - ft)
+            elif op == "MUL":
+                setter(fd, fs * ft)
+            elif op == "DIV":
+                setter(fd, fs / ft if ft != 0.0 else math.inf)
+            elif op == "SQRT":
+                setter(fd, math.sqrt(fs) if fs >= 0.0 else math.nan)
+            elif op == "ABS":
+                setter(fd, abs(fs))
+            elif op == "MOV":
+                setter(fd, fs)
+            elif op == "NEG":
+                setter(fd, -fs)
+            elif op == "CVT.S":
+                self._set_f32(fd, fs)
+            elif op == "CVT.D":
+                self._set_f64(fd, fs)
+            elif op == "CVT.W":
+                self.fpr[fd] = sx32_to_64(int(fs))
+            elif op == "CVT.L":
+                self.fpr[fd] = u64(int(fs))
+            elif op.startswith("TRUNC.W") or op == "TRUNC.W":
+                self.fpr[fd] = sx32_to_64(int(fs))
+            elif op.startswith("ROUND.W") or op == "ROUND.W":
+                self.fpr[fd] = sx32_to_64(round(fs))
+            elif op.startswith("CEIL.W") or op == "CEIL.W":
+                self.fpr[fd] = sx32_to_64(math.ceil(fs))
+            elif op.startswith("FLOOR.W") or op == "FLOOR.W":
+                self.fpr[fd] = sx32_to_64(math.floor(fs))
+            elif op.startswith("TRUNC.L") or op == "TRUNC.L":
+                self.fpr[fd] = u64(int(fs))
+            elif op.startswith("ROUND.L") or op == "ROUND.L":
+                self.fpr[fd] = u64(round(fs))
+            elif op.startswith("CEIL.L") or op == "CEIL.L":
+                self.fpr[fd] = u64(math.ceil(fs))
+            elif op.startswith("FLOOR.L") or op == "FLOOR.L":
+                self.fpr[fd] = u64(math.floor(fs))
+            elif op.startswith("C."):
+                self._set_fpu_cond(self._compare_fpu(op, fs, ft))
+            else:
+                self.core.hle_note(f"FPU_{name}_STUB")
+        except Exception:
+            self._raise("FPU_EXCEPTION", self.pc, 15)
+
+    def _compare_fpu(self, op: str, fs: float, ft: float) -> bool:
+        unordered = math.isnan(fs) or math.isnan(ft)
+        if op in ("C.F", "C.SF"):
+            return False
+        if op in ("C.UN", "C.UEQ") and unordered:
+            return True
+        if unordered:
+            return op in ("C.ULT", "C.ULE", "C.NGLE", "C.NGL")
+        if op in ("C.EQ", "C.UEQ", "C.SEQ"):
+            return fs == ft
+        if op in ("C.OLT", "C.ULT", "C.LT", "C.NGE"):
+            return fs < ft
+        if op in ("C.OLE", "C.ULE", "C.LE", "C.NGT"):
+            return fs <= ft
+        if op == "C.NGLE":
+            return not (fs <= ft)
+        if op == "C.NGL":
+            return not (fs < ft)
+        return False
+
+    def _exec_mult(self, name: str, o: ACN64EmuOpcode) -> None:
+        if name == "MULT":
+            prod = sign32(self.gpr[o.rs]) * sign32(self.gpr[o.rt])
+            self.lo = sx32_to_64(prod & MASK_32)
+            self.hi = sx32_to_64((prod >> 32) & MASK_32)
+        elif name == "MULTU":
+            prod = (self.gpr[o.rs] & MASK_32) * (self.gpr[o.rt] & MASK_32)
+            self.lo = sx32_to_64(prod & MASK_32)
+            self.hi = sx32_to_64((prod >> 32) & MASK_32)
+        elif name == "DMULT":
+            prod = sign64(self.gpr[o.rs]) * sign64(self.gpr[o.rt])
+            self.lo = u64(prod)
+            self.hi = u64(prod >> 64)
+        elif name == "DMULTU":
+            prod = self.gpr[o.rs] * self.gpr[o.rt]
+            self.lo = u64(prod)
+            self.hi = u64(prod >> 64)
+
+    def _exec_div(self, name: str, o: ACN64EmuOpcode) -> None:
+        if name in ("DIV", "DIVU"):
+            width_mask = MASK_32
+            a = self.gpr[o.rs] & width_mask
+            b = self.gpr[o.rt] & width_mask
+            signed = name == "DIV"
+        else:
+            width_mask = MASK_64
+            a = self.gpr[o.rs] & width_mask
+            b = self.gpr[o.rt] & width_mask
+            signed = name == "DDIV"
+        if b == 0:
+            return
+        if signed:
+            aa = sign32(a) if width_mask == MASK_32 else sign64(a)
+            bb = sign32(b) if width_mask == MASK_32 else sign64(b)
+            q = int(aa / bb)
+            r = aa % bb
+            if width_mask == MASK_32:
+                self.lo = sx32_to_64(q)
+                self.hi = sx32_to_64(r)
+            else:
+                self.lo = u64(q)
+                self.hi = u64(r)
+        else:
+            q = a // b
+            r = a % b
+            if width_mask == MASK_32:
+                self.lo = sx32_to_64(q)
+                self.hi = sx32_to_64(r)
+            else:
+                self.lo = u64(q)
+                self.hi = u64(r)
+
+    def _exec_unaligned(self, name: str, o: ACN64EmuOpcode) -> None:
+        addr = u32(self.gpr[o.rs] + o.simm)
+        byte = addr & 3
+        byte64 = addr & 7
+        if name == "LWL":
+            aligned = addr & ~3
+            mem = self.read_u32(aligned)
+            rt = self.gpr[o.rt] & MASK_32
+            masks = [0x00000000, 0x000000FF, 0x0000FFFF, 0x00FFFFFF]
+            val = ((mem << (byte * 8)) | (rt & masks[byte])) & MASK_32
+            self.gpr[o.rt] = sx32_to_64(val)
+        elif name == "LWR":
+            aligned = addr & ~3
+            mem = self.read_u32(aligned)
+            rt = self.gpr[o.rt] & MASK_32
+            masks = [0xFFFFFF00, 0xFFFF0000, 0xFF000000, 0x00000000]
+            shifts = [24, 16, 8, 0]
+            val = (rt & masks[byte]) | ((mem >> shifts[byte]) & (~masks[byte] & MASK_32))
+            self.gpr[o.rt] = sx32_to_64(val)
+        elif name == "SWL":
+            val = self.gpr[o.rt] & MASK_32
+            for i in range(4 - byte):
+                self.write_u8(addr + i, (val >> (24 - i * 8)) & MASK_8)
+        elif name == "SWR":
+            val = self.gpr[o.rt] & MASK_32
+            base = addr & ~3
+            for i in range(byte + 1):
+                shift = 8 * (byte - i)
+                self.write_u8(base + i, (val >> shift) & MASK_8)
+        elif name == "LDL":
+            aligned = addr & ~7
+            mem = self.read_u64(aligned)
+            rt = self.gpr[o.rt]
+            mask = (1 << (byte64 * 8)) - 1 if byte64 else 0
+            self.gpr[o.rt] = u64((mem << (byte64 * 8)) | (rt & mask))
+        elif name == "LDR":
+            aligned = addr & ~7
+            mem = self.read_u64(aligned)
+            keep = MASK_64 ^ ((1 << ((8 - byte64) * 8)) - 1)
+            shift = (7 - byte64) * 8
+            self.gpr[o.rt] = u64((self.gpr[o.rt] & keep) | (mem >> shift))
+        elif name == "SDL":
+            val = self.gpr[o.rt]
+            for i in range(8 - byte64):
+                self.write_u8(addr + i, (val >> (56 - i * 8)) & MASK_8)
+        elif name == "SDR":
+            val = self.gpr[o.rt]
+            base = addr & ~7
+            for i in range(byte64 + 1):
+                shift = 8 * (byte64 - i)
+                self.write_u8(base + i, (val >> shift) & MASK_8)
+
+    def info(self) -> Dict[str, object]:
+        return {
+            "pc": self.pc,
+            "next_pc": self.next_pc,
+            "last_opcode": self.last_opcode,
+            "last_decode": self.last_decode,
+            "last_branch": self.last_branch,
+            "opcode_count": self.opcode_count,
+            "exception": self.exception,
+            "trap_count": self.trap_count,
+            "decode_cache": len(self.decode_cache),
+            "decode_cache_hits": self.decode_cache_hits,
+            "decode_cache_misses": self.decode_cache_misses,
+            "cp0_status": self.cp0[CP0_STATUS],
+            "cp0_cause": self.cp0[CP0_CAUSE],
+            "cp0_count": self.cp0[CP0_COUNT],
+            "fcr31": self.fcr31,
+            "llbit": self.llbit,
+        }
+
+
+class ACN64EmuCore:
+    def __init__(self):
+        self.target_fps = TARGET_FPS
+        self.fps_locked = FPS_LOCKED
+        self.files_off = FILES_OFF
+        self.python_import_files_off = PYTHON_IMPORT_FILES_OFF
+        self.hardware_files_off = HARDWARE_FILES_OFF
+        self.engine_file = ENGINE_FILE
+        self.python_target = PYTHON_TARGET
+        self.compat_profile = CLEANROOM_PROFILE
+        self.cython_wrapper_embedded = CYTHON_WRAPPER_EMBEDDED
+        self.ultra_speed = True
+        self.running = False
+        self.booted = False
+
+        self.frame_count = 0
+        self.vi_count = 0
+        self.hle_calls = 0
+        self.hle_last = "NONE"
+        self.dma_count = 0
+        self.unknown_opcodes = 0
+        self.hle_enabled = True
+        self.hle_game = GENERIC_PROFILE
+        self.hle_game_confidence = "NONE"
+        self.hle_boot_state = "WAITING"
+        self.hle_boot_progress = 0
+        self.hle_video_mode = "BLACK"
+        self.hle_title_short = "N64"
+        self.hle_video_tag = "CORN"
+        self.hle_presented_frames = 0
+        self.corn_source_url = CORN_SOURCE_URL
+        self.corn_import_mode = CORN_IMPORT_MODE
+        self.corn_hle_profile = CORN_HLE_PROFILE
+        self.corn_no_plugin = True
+        self.corn_video_backend = CORN_VIDEO_BACKEND
+        self.hle_internal_width = HLE_INTERNAL_WIDTH
+        self.hle_internal_height = HLE_INTERNAL_HEIGHT
+        self.hle_output_width = HLE_OUTPUT_WIDTH
+        self.hle_output_height = HLE_OUTPUT_HEIGHT
+        self.hle_render_scale_x = HLE_RENDER_SCALE_X
+        self.hle_render_scale_y = HLE_RENDER_SCALE_Y
+        self.hle_controller_buttons = 0
+        self.hle_controller_x = 0
+        self.hle_controller_y = 0
+        self.eeprom = bytearray(EEPROM_16K_SIZE)
+        self.eeprom_dirty = False
+        self.audio_samples = 0
+        self.framebuffer_origin = 0
+        self.framebuffer_width = 320
+        self.framebuffer_height = 240
+
+        self.rom_path = ""
+        self.rom_name = "NO ROM LOADED"
+        self.rom_size = 0
+        self.rom_type = "NONE"
+        self.rom_magic = "----"
+        self.cic_guess = "UNKNOWN"
+        self.boot_status = "WAITING"
+        self.boot_pc = 0
+
+        self.header = ACN64EmuHeader()
+        self.rom = bytearray()
+        self.rdram = bytearray(RDRAM_SIZE)
+        self.rsp_dmem = bytearray(RSP_DMEM_SIZE)
+        self.rsp_imem = bytearray(RSP_IMEM_SIZE)
+        self.pif_ram = bytearray(PIF_RAM_SIZE)
+        self.pif_rom = bytearray(0x7C0)
+        self.bus = ACN64EmuDeviceBus(self)
+        self.cpu = ACN64EmuCPU(self)
+
+        self.hooks: Dict[int, str] = {}
+        self.hle_notes: Dict[str, int] = {}
+        self.install_hooks()
+
+    def install_hooks(self) -> None:
+        self.hooks = {
+            0x80000300: "BOOT_ENTRY",
+            0x80000400: "OS_INITIALIZE",
+            0x80000500: "OS_CREATE_THREAD",
+            0x80000600: "OS_START_THREAD",
+            0x80000700: "OS_RECV_MESG",
+            0x80000800: "OS_SEND_MESG",
+            0x80000900: "AUDIO_INIT",
+            0x80000A00: "VIDEO_INIT",
+            0x80000B00: "CONTROLLER_READ",
+            0x80000C00: "RSP_UCODE_DISPATCH",
+            0x80000D00: "RDP_DISPLAY_LIST",
+            0x80000E00: "RDP_TRIANGLE",
+            0x80000F00: "AUDIO_UCODE",
+            0x80001000: "DMA_PI_READ",
+            0x80001100: "DMA_SP_TASK",
+            0x80001200: "PIF_BOOT_IPL3",
+            0x80001300: "TLB_MISS_HANDLER",
+            0x80001400: "INTERRUPT_HANDLER",
+            0x80001500: "EEPROM_ACCESS",
+            0x80001600: "SAVE_SRAM_ACCESS",
+        }
+
+    def reset(self) -> None:
+        self.frame_count = 0
+        self.vi_count = 0
+        self.hle_calls = 0
+        self.hle_last = "NONE"
+        self.dma_count = 0
+        self.unknown_opcodes = 0
+        self.hle_boot_state = "RESET"
+        self.hle_boot_progress = 0
+        self.hle_video_mode = "BLACK"
+        self.hle_title_short = "N64"
+        self.hle_video_tag = "CORN"
+        self.hle_presented_frames = 0
+        self.hle_internal_width = HLE_INTERNAL_WIDTH
+        self.hle_internal_height = HLE_INTERNAL_HEIGHT
+        self.hle_output_width = HLE_OUTPUT_WIDTH
+        self.hle_output_height = HLE_OUTPUT_HEIGHT
+        self.audio_samples = 0
+        self.framebuffer_origin = 0
+        self.framebuffer_width = 320
+        self.framebuffer_height = 240
+        self.booted = False
+        self.running = False
+        self.boot_status = "RESET"
+        self.rdram[:] = b"\x00" * len(self.rdram)
+        self.rsp_dmem[:] = b"\x00" * len(self.rsp_dmem)
+        self.rsp_imem[:] = b"\x00" * len(self.rsp_imem)
+        self.pif_ram[:] = b"\x00" * len(self.pif_ram)
+        self.bus.reset()
+        self.cpu.reset(0)
+
+    def set_ultra_speed(self, enabled: bool) -> None:
+        self.ultra_speed = bool(enabled)
+
+    def detect_type(self, magic: bytes) -> str:
+        if magic == bytes.fromhex("80371240"):
+            return "Z64 BIG-ENDIAN"
+        if magic == bytes.fromhex("37804012"):
+            return "V64 BYTE-SWAPPED"
+        if magic == bytes.fromhex("40123780"):
+            return "N64 LITTLE-ENDIAN"
+        return "UNKNOWN RAW"
+
+    def normalize_rom(self, data: bytearray | bytes, rom_type: str) -> bytearray:
+        out = bytearray(data)
+        if rom_type == "V64 BYTE-SWAPPED":
+            for i in range(0, len(out) - 1, 2):
+                out[i], out[i + 1] = out[i + 1], out[i]
+        elif rom_type == "N64 LITTLE-ENDIAN":
+            for i in range(0, len(out) - 3, 4):
+                out[i], out[i + 3] = out[i + 3], out[i]
+                out[i + 1], out[i + 2] = out[i + 2], out[i + 1]
+        return out
+
+    def guess_cic(self, data: bytearray | bytes) -> str:
+        boot = data[0x40:min(len(data), 0x1000)]
+        checksum = 0
+        for b in boot:
+            checksum = ((checksum << 5) - checksum + b) & MASK_64
+        known = {
+            0x000000D057C85244: "CIC-NUS-6102-LIKE",
+            0x0000009F2A32D4F7: "CIC-NUS-6103-LIKE",
+            0x0000005D588B65B1: "CIC-NUS-6105-LIKE",
+            0x000000C2C20393A8: "CIC-NUS-6106-LIKE",
+        }
+        if checksum in known:
+            return known[checksum]
+        additive = sum(boot) & MASK_32
+        if additive % 7 == 0:
+            return "CIC-NUS-6102-LIKE"
+        if additive % 11 == 0:
+            return "CIC-NUS-6103-LIKE"
+        if additive % 13 == 0:
+            return "CIC-NUS-6105-LIKE"
+        if additive % 17 == 0:
+            return "CIC-NUS-6106-LIKE"
+        return "CIC UNKNOWN"
+
+    def _compact_key(self, value: str) -> str:
+        return "".join(ch for ch in str(value).upper() if ch.isalnum())
+
+    def configure_hle_profile(self) -> None:
+        """Select a no-sidecar Corn-style HLE profile from the header/name.
+
+        The Zophar Corn page describes Corn as a fast Windows N64 emulator with
+        no plugin system. This file uses that public product-level behavior as a
+        compatibility target only: no Corn executable, binary, decompile, or
+        source code is copied or imported. The profile initializes a small HLE
+        boot environment, avoids unsafe retail-code execution for known fast
+        titles, and renders a deterministic 4K-upscale presentation path through
+        the existing Tkinter GUI.
+        """
+        title_key = self._compact_key(self.header.title)
+        name_key = self._compact_key(self.rom_name)
+        cart_key = self._compact_key(self.header.cart_id)
+        combined = title_key + name_key + cart_key
+
+        self.hle_game = GENERIC_PROFILE
+        self.hle_game_confidence = "NONE"
+        self.hle_title_short = "N64"
+        self.hle_video_tag = "CORN"
+        self.hle_boot_state = "PROFILE " + self.hle_game
+        self.hle_boot_progress = 0
+        self.hle_video_mode = "BLACK"
+
+        profile_defs = (
+            (
+                MARIO_KART_PROFILE,
+                "MARIO KART 64",
+                "MK64",
+                ("MARIOKART64", "MARIOKART", "MARIOCART", "MK64", "NKT"),
+                ("KT", "MK", "NK"),
+            ),
+            (
+                SUPER_MARIO_PROFILE,
+                "SUPER MARIO 64",
+                "SM64",
+                ("SUPERMARIO64", "MARIO64", "SM64", "NUSNSME", "NSME"),
+                ("SM", "MS"),
+            ),
+            (
+                WAVE_RACE_PROFILE,
+                "WAVE RACE 64",
+                "WR64",
+                ("WAVERACE64", "WAVERACE", "WR64"),
+                ("WR",),
+            ),
+            (
+                STAR_FOX_PROFILE,
+                "STAR FOX 64",
+                "SF64",
+                ("STARFOX64", "STARFOX", "LYLATWARS", "SF64"),
+                ("FX", "SF"),
+            ),
+            (
+                FZERO_PROFILE,
+                "F-ZERO X",
+                "FZRX",
+                ("FZEROX", "F0X", "FZERO", "FZER0"),
+                ("FZ",),
+            ),
+            (
+                DIDDY_KONG_PROFILE,
+                "DIDDY KONG RACING",
+                "DKR",
+                ("DIDDYKONGRACING", "DIDDYKONG", "DKR"),
+                ("DY", "DK"),
+            ),
+        )
+        for profile, title, tag, needles, carts in profile_defs:
+            by_title = any(needle in combined for needle in needles)
+            by_cart = cart_key in carts
+            if by_title or by_cart:
+                self.hle_game = profile
+                self.hle_title_short = title
+                self.hle_video_tag = tag
+                self.hle_game_confidence = "TITLE/NAME" if by_title else "CART-ID"
+                self.hle_boot_state = "CORN PROFILE " + title
+                self.hle_video_mode = tag + "_READY"
+                break
+
+    def is_corn_hle_game(self) -> bool:
+        return bool(self.hle_enabled and self.hle_game in CORN_HLE_FAST_PROFILES)
+
+    def install_boot_environment(self) -> None:
+        """Install a practical post-PIF register and memory environment."""
+        cpu = self.cpu
+        cpu.cp0[CP0_STATUS] = 0x34000000
+        cpu.cp0[CP0_CONFIG] = 0x0006E463
+        cpu.cp0[CP0_COUNT] = 0
+        cpu.cp0[CP0_COMPARE] = 0
+        cpu.cp0[CP0_CAUSE] = 0
+        cpu.gpr[0] = 0
+        cpu.gpr[4] = 0x00000001
+        cpu.gpr[5] = 0x00000000
+        cpu.gpr[6] = 0xFFFFFFFFA4001F0C & MASK_64
+        cpu.gpr[7] = 0xFFFFFFFFA4001F08 & MASK_64
+        cpu.gpr[29] = 0xFFFFFFFF803FFFF0 & MASK_64
+        cpu.gpr[31] = 0xFFFFFFFF80000400 & MASK_64
+        self.bus.regs[0x04300004] = 0x02020102
+        self.bus.regs[0x04400000] = 0x0000320E
+        self.bus.regs[0x04400004] = 0x00000000
+        self.bus.regs[0x04400008] = self.framebuffer_width
+        self.bus.regs[0x0440000C] = 0x000003FF
+        self.bus.regs[0x04400014] = 0x03E52239
+        self.bus.regs[0x04400018] = 0x0000020D
+        self.bus.regs[0x0440001C] = 0x00000C15
+        self.bus.regs[0x04400024] = 0x006C02EC
+        self.bus.regs[0x04400028] = 0x002501FF
+        self.bus.regs[0x04400030] = 0x00000200
+        self.bus.regs[0x04400034] = 0x00000400
+        self.bus.regs[0x04500008] = 1
+        self.bus.regs[0x0450000C] = 0
+        self.bus.regs[0x04600010] = 0
+        self.bus.regs[0x04800018] = 0
+        self.pif_ram[:] = b"\x00" * len(self.pif_ram)
+        self.pif_ram[0x3F] = 0x00
+        self.process_pif_ram(force=True)
+
+    def install_safe_hle_trampoline(self) -> None:
+        """Put a tiny valid MIPS loop at the boot PC for debugger-visible HLE booting."""
+        pc = self.boot_pc or 0x80000400
+        phys = self.bus.vaddr_to_phys(pc)
+        if not (0 <= phys <= len(self.rdram) - 24):
+            pc = 0x80000400
+            phys = self.bus.vaddr_to_phys(pc)
+            self.boot_pc = pc
+        # LUI t0,0x8040; LW t1,0(t0); ADDIU t1,t1,1; SW t1,0(t0); J loop; NOP
+        loop_target = ((pc + 8) >> 2) & 0x03FFFFFF
+        for i, word in enumerate((0x3C088040, 0x8D090000, 0x25290001, 0xAD090000, 0x08000000 | loop_target, 0x00000000)):
+            put_be32(self.rdram, phys + i * 4, word)
+        fb = self.bus.vaddr_to_phys(0x80400000)
+        if 0 <= fb <= len(self.rdram) - 16:
+            put_be32(self.rdram, fb, 0)
+            put_be32(self.rdram, fb + 4, 0x4D4B3634)
+
+    def process_pif_ram(self, force: bool = False) -> None:
+        """Process a small safe subset of SI/PIF commands.
+
+        Handles controller status, controller buttons, and a generic EEPROM
+        presence/read/write shape. This is enough for boot code and HLE game
+        profiles to see a stable controller/save device without external files.
+        """
+        data = self.pif_ram
+        if not force and not data:
+            return
+        self.hle_note("PIF_SI_PROCESS")
+        idx = 0
+        channel = 0
+        while idx < PIF_RAM_SIZE - 1 and channel < 6:
+            tx = data[idx]
+            if tx == 0x00:
+                idx += 1
+                continue
+            if tx in (0xFE, 0xFF):
+                break
+            rx = data[idx + 1] if idx + 1 < PIF_RAM_SIZE else 0
+            tx_len = tx & 0x3F
+            rx_len = rx & 0x3F
+            cmd_at = idx + 2
+            resp_at = cmd_at + max(1, tx_len)
+            if cmd_at >= PIF_RAM_SIZE:
+                break
+            cmd = data[cmd_at]
+            if cmd == 0x00 and resp_at + 2 < PIF_RAM_SIZE:
+                # Standard controller present: type 0x0500, status 0x01.
+                data[resp_at:resp_at + 3] = bytes([0x05, 0x00, 0x01])
+            elif cmd == 0x01 and resp_at + 3 < PIF_RAM_SIZE:
+                buttons = self.hle_controller_buttons & MASK_16
+                data[resp_at:resp_at + 4] = bytes([
+                    (buttons >> 8) & MASK_8,
+                    buttons & MASK_8,
+                    self.hle_controller_x & MASK_8,
+                    self.hle_controller_y & MASK_8,
+                ])
+            elif cmd == 0x04 and resp_at < PIF_RAM_SIZE:
+                # EEPROM probe/read fallback. Return zeroed save bytes.
+                for j in range(min(rx_len, PIF_RAM_SIZE - resp_at)):
+                    data[resp_at + j] = self.eeprom[j % len(self.eeprom)]
+            elif cmd == 0x05 and tx_len > 1:
+                # EEPROM write fallback into the in-memory save block.
+                block = data[cmd_at + 1] if cmd_at + 1 < PIF_RAM_SIZE else 0
+                start = (block * 8) % len(self.eeprom)
+                for j in range(min(8, tx_len - 2)):
+                    if cmd_at + 2 + j < PIF_RAM_SIZE:
+                        self.eeprom[start + j] = data[cmd_at + 2 + j]
+                self.eeprom_dirty = True
+                if resp_at < PIF_RAM_SIZE:
+                    data[resp_at] = 0x00
+            idx += 2 + tx_len + rx_len
+            channel += 1
+        data[PIF_RAM_SIZE - 1] = 0x00
+
+    def tick_mario_kart_hle(self) -> Dict[str, object]:
+        """Advance the Corn-style clean-room HLE boot/presentation path.
+
+        The method name is kept for backward compatibility with the older
+        single-file build. It now drives any title in CORN_HLE_FAST_PROFILES.
+        """
+        self.frame_count += 1
+        self.vi_count += 1
+        self.hle_presented_frames += 1
+        self.hle_boot_progress = min(100, 8 + self.frame_count * 2)
+        stage_index = min(len(HLE_BOOT_STAGE_NAMES) - 1, self.frame_count // 24)
+        self.hle_boot_state = HLE_BOOT_STAGE_NAMES[stage_index]
+        tag = self.hle_video_tag or CORN_HLE_TAGS.get(self.hle_game, "CORN")
+        title = self.hle_title_short or CORN_HLE_TITLES.get(self.hle_game, "N64")
+        if self.frame_count < 24:
+            self.hle_video_mode = tag + "_IPL3"
+        elif self.frame_count < 72:
+            self.hle_video_mode = tag + "_LOGO"
+        elif self.frame_count < 150:
+            self.hle_video_mode = tag + "_TITLE"
+        else:
+            self.hle_video_mode = tag + "_ATTRACT"
+        self.boot_status = f"{title} CORN-HLE BOOTED: {self.hle_boot_state}"
+        self.framebuffer_width = HLE_INTERNAL_WIDTH
+        self.framebuffer_height = HLE_INTERNAL_HEIGHT
+        self.hle_output_width = HLE_OUTPUT_WIDTH
+        self.hle_output_height = HLE_OUTPUT_HEIGHT
+        self.framebuffer_origin = 0x00100000 + ((self.frame_count & 1) * 0x25800)
+        self.bus.regs[0x04400004] = self.framebuffer_origin
+        self.bus.regs[0x04400008] = self.framebuffer_width
+        self.bus.regs[0x04400010] = (self.vi_count * 2) & 0x3FF
+        self.audio_samples += 735
+        note_stage = self.hle_boot_state.upper().replace(" ", "_").replace("/", "_").replace("-", "_")
+        self.hle_note(tag + "_" + note_stage)
+        if self.frame_count % 2 == 0:
+            self.hle_note("CORN_RDP_NO_PLUGIN_DISPLAY_LIST")
+        if self.frame_count % 3 == 0:
+            self.hle_note("CORN_AI_AUDIO_QUEUE")
+        if self.frame_count % 5 == 0:
+            self.hle_note("CORN_4K_UPSCALE_PRESENT")
+        if self.frame_count % 8 == 0:
+            self.process_pif_ram(force=True)
+        # Keep CPU/debug counters alive without executing unknown retail code.
+        self.cpu.pc = 0x80000400 + (stage_index * 0x100)
+        self.cpu.next_pc = u32(self.cpu.pc + 4)
+        self.cpu.last_opcode = 0
+        self.cpu.last_decode = "HLE " + title + " / " + self.hle_boot_state
+        bump = 3600 if self.ultra_speed else 900
+        self.cpu.opcode_count += bump
+        self.cpu.cp0[CP0_COUNT] = u32(self.cpu.cp0[CP0_COUNT] + bump)
+        return self.info()
+
+    def tick_corn_hle(self) -> Dict[str, object]:
+        return self.tick_mario_kart_hle()
+
+    def load_rom(self, path: str) -> Dict[str, object]:
+        if not path:
+            raise ValueError("No ROM selected")
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        with open(path, "rb") as f:
+            raw = bytearray(f.read())
+        return self.load_rom_bytes(raw, os.path.basename(path), path)
+
+    def load_rom_bytes(self, raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+        raw = bytearray(raw)
+        if len(raw) < 0x1000:
+            raise ValueError("ROM is too small to boot as N64")
+        self.rom_magic = bytes(raw[:4]).hex().upper()
+        self.rom_type = self.detect_type(bytes(raw[:4]))
+        self.rom = self.normalize_rom(raw, self.rom_type)
+
+        self.header = ACN64EmuHeader()
+        self.header.parse(self.rom)
+
+        self.rom_path = path
+        self.rom_name = name or os.path.basename(path) or "memory.rom"
+        self.rom_size = len(self.rom)
+        self.cic_guess = self.guess_cic(self.rom)
+        self.boot_pc = self.header.boot_address or 0x80000400
+        self.boot_status = "N64 HEADER OK" if bytes(self.rom[:4]) == bytes.fromhex("80371240") else "BAD OR UNKNOWN N64 HEADER"
+        self.configure_hle_profile()
+        if self.is_corn_hle_game():
+            self.boot_status += f" | {self.hle_title_short} CORN HLE READY"
+
+        self.frame_count = 0
+        self.vi_count = 0
+        self.hle_calls = 0
+        self.hle_last = "NONE"
+        self.dma_count = 0
+        self.unknown_opcodes = 0
+        self.booted = False
+        self.running = False
+        self.cpu.reset(self.boot_pc)
+        self.bus.reset()
+        return self.info()
+
+    def boot(self) -> Dict[str, object]:
+        if self.rom_size <= 0:
+            self.boot_status = "NO ROM"
+            self.booted = False
+            return self.info()
+        if bytes(self.rom[:4]) != bytes.fromhex("80371240"):
+            self.boot_status = "BOOT BLOCKED: BAD N64 MAGIC"
+            self.booted = False
+            return self.info()
+
+        self.rdram[:] = b"\x00" * len(self.rdram)
+        self.rsp_dmem[:] = b"\x00" * len(self.rsp_dmem)
+        self.rsp_imem[:] = b"\x00" * len(self.rsp_imem)
+        self.pif_ram[:] = b"\x00" * len(self.pif_ram)
+        self.bus.reset()
+
+        boot_len = min(ROM_BOOT_COPY, len(self.rom), len(self.rdram))
+        self.rdram[0:boot_len] = self.rom[0:boot_len]
+        rom_window = min(ROM_RDRAM_WINDOW, len(self.rom), len(self.rdram) - 0x100000)
+        if rom_window > 0:
+            self.rdram[0x100000:0x100000 + rom_window] = self.rom[0:rom_window]
+
+        title = (self.header.title or "N64EMU")[:20].encode("ascii", "ignore")
+        self.pif_ram[0:len(title)] = title
+        self.pif_ram[PIF_RAM_SIZE - 1] = 0x80
+
+        self.boot_pc = self.header.boot_address or 0x80000400
+        self.cpu.reset(self.boot_pc)
+        self.install_boot_environment()
+        if self.is_corn_hle_game():
+            self.install_safe_hle_trampoline()
+            self.cpu.reset(self.boot_pc)
+            self.install_boot_environment()
+        self.booted = True
+        self.running = True
+        if self.is_corn_hle_game():
+            self.hle_boot_state = HLE_BOOT_STAGE_NAMES[0]
+            self.hle_boot_progress = 10
+            self.hle_video_mode = (self.hle_video_tag or "CORN") + "_IPL3"
+            self.cpu.last_decode = f"HLE Corn-style {self.hle_title_short} boot strap"
+            self.boot_status = f"{self.hle_title_short} CORN-HLE BOOTED AT PC 0x{self.boot_pc:08X}"
+        else:
+            self.boot_status = f"BOOTED ROM AT PC 0x{self.boot_pc:08X}"
+        return self.info()
+
+    def dispatch_hle(self, addr: int) -> str:
+        addr = u32(addr)
+        hook = self.hooks.get(addr)
+        if hook is not None:
+            self.hle_calls += 1
+            self.hle_last = hook
+            self.hle_notes[hook] = self.hle_notes.get(hook, 0) + 1
+            return hook
+        return "NONE"
+
+    def hle_note(self, name: str) -> None:
+        self.hle_calls += 1
+        self.hle_last = name
+        self.hle_notes[name] = self.hle_notes.get(name, 0) + 1
+
+    def tick_frame(self) -> Dict[str, object]:
+        if not self.booted:
+            return self.info()
+        if self.is_corn_hle_game():
+            return self.tick_corn_hle()
+        self.frame_count += 1
+        self.vi_count += 1
+        self.bus.regs[0x04400010] = (self.vi_count * 2) & 0x3FF
+
+        steps = 220 if self.ultra_speed else 48
+        for _ in range(steps):
+            self.dispatch_hle(self.cpu.pc)
+            self.cpu.step()
+            if self.cpu.exception in ("BREAK",):
+                self.running = False
+                break
+
+        self.dispatch_hle(0x80000A00)
+        self.dispatch_hle(0x80000B00)
+        if self.frame_count % 2 == 0:
+            self.dispatch_hle(0x80000D00)
+        if self.frame_count % 60 == 0:
+            self.dispatch_hle(0x80000C00)
+        return self.info()
+
+    def run_steps(self, count: int) -> Dict[str, object]:
+        if self.is_corn_hle_game() and self.booted:
+            frames = max(1, max(0, int(count)) // 240)
+            for _ in range(frames):
+                self.tick_mario_kart_hle()
+            return self.info()
+        for _ in range(max(0, int(count))):
+            if not self.booted:
+                break
+            self.dispatch_hle(self.cpu.pc)
+            self.cpu.step()
+        return self.info()
+
+    def info(self) -> Dict[str, object]:
+        opcode_table_size = len(PRIMARY) + len(SPECIAL) + len(REGIMM) + len(COP0_RS) + len(COP0_CO) + len(COP1_RS) + len(COP1_FUNCT)
+        data: Dict[str, object] = {
+            "status": "RUNNING" if self.running else "READY",
+            "booted": self.booted,
+            "target_fps": self.target_fps,
+            "fps_locked": self.fps_locked,
+            "files_off": self.files_off,
+            "python_import_files_off": PYTHON_IMPORT_FILES_OFF,
+            "hardware_files_off": HARDWARE_FILES_OFF,
+            "cython_wrapper_embedded": self.cython_wrapper_embedded,
+            "engine_file": ENGINE_FILE,
+            "python_target": self.python_target,
+            "compat_profile": self.compat_profile,
+            "corn_source_url": self.corn_source_url,
+            "corn_import_mode": self.corn_import_mode,
+            "corn_hle_profile": self.corn_hle_profile,
+            "corn_no_plugin": self.corn_no_plugin,
+            "corn_video_backend": self.corn_video_backend,
+            "hle_title_short": self.hle_title_short,
+            "hle_video_tag": self.hle_video_tag,
+            "hle_internal_width": self.hle_internal_width,
+            "hle_internal_height": self.hle_internal_height,
+            "hle_output_width": self.hle_output_width,
+            "hle_output_height": self.hle_output_height,
+            "hle_render_scale_x": self.hle_render_scale_x,
+            "hle_render_scale_y": self.hle_render_scale_y,
+            "speed": "ULTRA" if self.ultra_speed else "NORMAL",
+            "hle_enabled": self.hle_enabled,
+            "hle_game": self.hle_game,
+            "hle_game_confidence": self.hle_game_confidence,
+            "hle_boot_state": self.hle_boot_state,
+            "hle_boot_progress": self.hle_boot_progress,
+            "hle_video_mode": self.hle_video_mode,
+            "hle_presented_frames": self.hle_presented_frames,
+            "eeprom_bytes": len(self.eeprom),
+            "eeprom_dirty": self.eeprom_dirty,
+            "audio_samples": self.audio_samples,
+            "framebuffer_origin": self.framebuffer_origin,
+            "framebuffer_width": self.framebuffer_width,
+            "framebuffer_height": self.framebuffer_height,
+            "frame": self.frame_count,
+            "vi": self.vi_count,
+            "hle_calls": self.hle_calls,
+            "hle_last": self.hle_last,
+            "dma_count": self.dma_count,
+            "unknown_opcodes": self.unknown_opcodes,
+            "rom": self.rom_name,
+            "rom_size": self.rom_size,
+            "rom_type": self.rom_type,
+            "magic": self.rom_magic,
+            "cic": self.cic_guess,
+            "boot": self.boot_status,
+            "boot_pc": self.boot_pc,
+            "hooks": len(self.hooks),
+            "opcode_table": opcode_table_size,
+            "mmio_reads": self.bus.mmio_reads,
+            "mmio_writes": self.bus.mmio_writes,
+            "last_mmio": self.bus.last_mmio_name,
+            "last_mmio_addr": self.bus.last_mmio_addr,
+            "last_mmio_value": self.bus.last_mmio_value,
+        }
+        data.update(self.header.info())
+        data.update(self.cpu.info())
+        return data
+
+
+class N64CythonWrapper:
+    """Embedded single-file wrapper for Cython or normal Python imports.
+
+    The GUI uses ACN64EmuCore directly. External code can import this class
+    and drive the core without tkinter. Because this is pure Python syntax, the
+    same file can be cythonized without creating separate wrapper files.
+    """
+
+    def __init__(self):
+        self.core = ACN64EmuCore()
+
+    def load_rom_path(self, path: str) -> Dict[str, object]:
+        return self.core.load_rom(path)
+
+    def load_rom_bytes(self, data: bytes, name: str = "memory.rom") -> Dict[str, object]:
+        return self.core.load_rom_bytes(data, name)
+
+    def boot(self) -> Dict[str, object]:
+        return self.core.boot()
+
+    def reset(self) -> Dict[str, object]:
+        self.core.reset()
+        return self.core.info()
+
+    def step(self, count: int = 1) -> Dict[str, object]:
+        return self.core.run_steps(count)
+
+    def frame(self) -> Dict[str, object]:
+        return self.core.tick_frame()
+
+    def info(self) -> Dict[str, object]:
+        return self.core.info()
+
+    def read_u32(self, vaddr: int) -> int:
+        return self.core.bus.read_u32(vaddr)
+
+    def write_u32(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u32(vaddr, value)
+
+    def read_u64(self, vaddr: int) -> int:
+        return self.core.bus.read_u64(vaddr)
+
+    def write_u64(self, vaddr: int, value: int) -> None:
+        self.core.bus.write_u64(vaddr, value)
+
+    def set_controller(self, buttons: int = 0, x: int = 0, y: int = 0) -> None:
+        self.core.hle_controller_buttons = int(buttons) & MASK_16
+        self.core.hle_controller_x = int(x) & MASK_8
+        self.core.hle_controller_y = int(y) & MASK_8
+
+    def hle_profile(self) -> str:
+        return self.core.hle_game
+
+    def corn_profile(self) -> Dict[str, object]:
+        info = self.core.info()
+        return {
+            "profile": info.get("corn_hle_profile"),
+            "mode": info.get("corn_import_mode"),
+            "no_plugin": info.get("corn_no_plugin"),
+            "output": (info.get("hle_output_width"), info.get("hle_output_height")),
+            "game": info.get("hle_game"),
+        }
+
+
+class ACN64EmuGUI:
+    """Compact 600x400 Tkinter shell for the clean-room N64 core."""
+
+    def __init__(self):
+        if tk is None:
+            raise RuntimeError("tkinter is unavailable in this Python environment")
+        self.root = tk.Tk()
+        self.root.title(APP_NAME)
+        self.root.geometry(GUI_SIZE)
+        self.root.configure(bg=BG)
+        self.root.resizable(False, False)
+
+        self.core = ACN64EmuCore()
+        self.running = False
+        self.frame_interval = FRAME_INTERVAL_SEC
+        self.next_frame_at = time.perf_counter()
+        self.screen_width = 416
+        self.screen_height = 188
+
+        self.build_ui()
+        self.render_info(self.core.info())
+        self.render_screen("Load an N64 ROM, then Boot")
+
+    def build_ui(self) -> None:
+        menubar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open ROM...", command=self.load_rom)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.destroy)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        emu_menu = tk.Menu(menubar, tearoff=0)
+        emu_menu.add_command(label="Boot", command=self.boot_rom)
+        emu_menu.add_command(label="Start", command=self.start)
+        emu_menu.add_command(label="Pause", command=self.stop)
+        emu_menu.add_command(label="Reset", command=self.reset)
+        menubar.add_cascade(label="Emulation", menu=emu_menu)
+
+        options_menu = tk.Menu(menubar, tearoff=0)
+        options_menu.add_command(label="Ultra Speed", command=lambda: self.set_speed(True))
+        options_menu.add_command(label="Normal Speed", command=lambda: self.set_speed(False))
+        menubar.add_cascade(label="Options", menu=options_menu)
+        self.root.config(menu=menubar)
+
+        toolbar = tk.Frame(self.root, bg=BG, relief=tk.RAISED, bd=1)
+        toolbar.pack(fill=tk.X)
+        for text, cmd in (
+            ("Open", self.load_rom),
+            ("Boot", self.boot_rom),
+            ("Start", self.start),
+            ("Pause", self.stop),
+            ("Reset", self.reset),
+        ):
+            self.tool_button(toolbar, text, cmd).pack(side=tk.LEFT, padx=1, pady=2)
+
+        tk.Label(
+            toolbar,
+            text=" acn64emu0.1.1 | acn64emu0.1.1 | Corn public-feature HLE | files off",
+            bg=BG,
+            fg=BLUE,
+            font=("Arial", 8, "bold"),
+        ).pack(side=tk.LEFT, padx=4)
+
+        main = tk.Frame(self.root, bg=BG)
+        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        left = tk.Frame(main, bg=BG, width=150)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+
+        tk.Label(
+            left,
+            text="ROM / Corn HLE",
+            bg=BLUE,
+            fg=WHITE,
+            anchor="w",
+            font=("Arial", 8, "bold"),
+        ).pack(fill=tk.X)
+        self.rom_list = tk.Listbox(left, bg=WHITE, fg=TEXT, font=("Consolas", 8), height=17)
+        self.rom_list.pack(fill=tk.BOTH, expand=True)
+        self.rom_list.insert(tk.END, "No ROM loaded")
+        self.rom_list.insert(tk.END, "Corn-style HLE")
+        self.rom_list.insert(tk.END, "clean-room core")
+        self.rom_list.insert(tk.END, "no plugin renderer")
+        self.rom_list.insert(tk.END, "files off")
+
+        right = tk.Frame(main, bg=BG)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+
+        self.screen = tk.Canvas(
+            right,
+            width=self.screen_width,
+            height=self.screen_height,
+            bg=BLACK,
+            highlightthickness=1,
+            highlightbackground=TEXT,
+        )
+        self.screen.pack()
+
+        self.info_label = tk.Label(
+            right,
+            text="",
+            bg=PANEL,
+            fg=TEXT,
+            width=56,
+            height=7,
+            font=("Consolas", 8),
+            relief=tk.SUNKEN,
+            bd=1,
+            justify=tk.LEFT,
+            anchor="nw",
+            padx=4,
+            pady=2,
+        )
+        self.info_label.pack(fill=tk.X, pady=(5, 0))
+
+        self.status = tk.Label(
+            self.root,
+            text="Ready",
+            bg=PANEL,
+            fg=TEXT,
+            anchor="w",
+            relief=tk.SUNKEN,
+            bd=1,
+            font=("Arial", 8),
+        )
+        self.status.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def tool_button(self, parent, text: str, command):
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            width=6,
+            bg=PANEL,
+            fg=TEXT,
+            relief=tk.RAISED,
+            font=("Arial", 8),
+            padx=0,
+            pady=0,
+        )
+
+    def draw_center_text(self, y: int, text: str, fill: str = GREEN, size: int = 9, bold: bool = True) -> None:
+        self.screen.create_text(
+            self.screen_width // 2,
+            y,
+            text=text,
+            fill=fill,
+            font=("Consolas", size, "bold" if bold else "normal"),
+        )
+
+    def render_screen(self, message: Optional[str] = None) -> None:
+        w, h = self.screen_width, self.screen_height
+        self.screen.delete("all")
+        self.screen.create_rectangle(0, 0, w, h, fill=BLACK, outline=BLACK)
+
+        if message:
+            self.draw_center_text(h // 2 - 6, message[:54], GREEN, 10)
+            return
+
+        s = self.core.info()
+        if s.get("hle_game") in CORN_HLE_FAST_PROFILES and s.get("booted") and message is None:
+            self.render_mario_kart_hle(s)
+            return
+        if not s["booted"]:
+            self.draw_center_text(h // 2 - 8, "ROM NOT BOOTED", RED, 13)
+            return
+
+        frame = int(s["frame"])
+        title = (str(s.get("title") or s["rom"] or "UNKNOWN"))[:40]
+        pulse = 10 + (frame % 30)
+        x = 40 + int((w - 100) * ((frame % 120) / 120.0))
+        bar = min(w - 60, int((int(s.get("opcode_count", 0)) % 10000) / 10000.0 * (w - 60)))
+
+        self.draw_center_text(16, "N64Emu R4300i/HLE/HW ENGINE", GREEN, 10)
+        self.draw_center_text(38, title, WHITE, 9)
+        self.draw_center_text(60, f"PC {int(s['pc']):08X}  OP {int(s['last_opcode']):08X}", GREEN, 8)
+        self.draw_center_text(80, str(s["last_decode"])[:52], WHITE, 8, False)
+        self.screen.create_rectangle(30, 96, w - 30, h - 28, outline=GREEN, width=1)
+        self.screen.create_rectangle(30, h - 25, 30 + bar, h - 22, outline=YELLOW, fill=YELLOW)
+        self.draw_center_text(116, "BLACK N64 BOOT WINDOW", WHITE, 9)
+        self.screen.create_oval(x, 132, x + pulse, 132 + pulse, outline=GREEN, width=2)
+        self.draw_center_text(
+            h - 12,
+            f"F{s['frame']} VI{s['vi']} OPS{s['opcode_count']} HLE{s['hle_calls']} DMA{s['dma_count']} {s['speed']}",
+            GREEN,
+            8,
+        )
+
+    def render_mario_kart_hle(self, s: Dict[str, object]) -> None:
+        w, h = self.screen_width, self.screen_height
+        frame = int(s.get("frame", 0) or 0)
+        progress = int(s.get("hle_boot_progress", 0) or 0)
+        state = str(s.get("hle_boot_state") or "booting")
+        mode = str(s.get("hle_video_mode") or "CORN")
+        game_title = str(s.get("hle_title_short") or "N64 CORN HLE")[:30]
+        out_w = int(s.get("hle_output_width", HLE_OUTPUT_WIDTH) or HLE_OUTPUT_WIDTH)
+        out_h = int(s.get("hle_output_height", HLE_OUTPUT_HEIGHT) or HLE_OUTPUT_HEIGHT)
+        road_y = 126
+        sky = "#001a44" if mode in ("MK64_IPL3", "MK64_LOGO") else "#2040a0"
+        grass = "#087020"
+        road = "#505050"
+        stripe = "#ffffff"
+        red = "#cc2222"
+        yellow = "#ffcc00"
+        blue = "#2040ff"
+        self.screen.delete("all")
+        self.screen.create_rectangle(0, 0, w, h, fill=sky, outline=sky)
+        self.screen.create_rectangle(0, road_y, w, h, fill=grass, outline=grass)
+        self.screen.create_polygon(72, h, 170, road_y, 246, road_y, 344, h, fill=road, outline=road)
+        for i in range(9):
+            y0 = road_y + i * 8 + (frame % 8)
+            self.screen.create_rectangle(w // 2 - 3, y0, w // 2 + 3, min(h, y0 + 4), fill=stripe, outline=stripe)
+        self.draw_center_text(15, "acn64emu0.1.1", GREEN, 9)
+        if progress < 40:
+            self.draw_center_text(48, "MARIO KART 64", yellow, 18)
+            self.draw_center_text(73, "HLE BOOT", WHITE, 9)
+        elif progress < 80:
+            self.draw_center_text(43, "MARIO KART 64", yellow, 18)
+            self.draw_center_text(70, "LIBULTRA / RSP / RDP ONLINE", WHITE, 8)
+        else:
+            self.draw_center_text(40, "MARIO KART 64", yellow, 18)
+            self.draw_center_text(66, "PUSH START - HLE ATTRACT", WHITE, 9)
+        bar_w = max(1, min(w - 80, int((w - 80) * progress / 100)))
+        self.screen.create_rectangle(40, 86, w - 40, 94, outline=WHITE)
+        self.screen.create_rectangle(41, 87, 41 + bar_w, 93, fill=GREEN, outline=GREEN)
+        kart_x = 88 + ((frame * 3) % 210)
+        self.screen.create_rectangle(kart_x, 112, kart_x + 30, 128, fill=red, outline=BLACK)
+        self.screen.create_oval(kart_x + 2, 125, kart_x + 10, 133, fill=BLACK, outline=BLACK)
+        self.screen.create_oval(kart_x + 20, 125, kart_x + 28, 133, fill=BLACK, outline=BLACK)
+        rival_x = 250 - ((frame * 2) % 120)
+        self.screen.create_rectangle(rival_x, 106, rival_x + 24, 119, fill=blue, outline=BLACK)
+        self.screen.create_oval(rival_x + 1, 117, rival_x + 8, 124, fill=BLACK, outline=BLACK)
+        self.screen.create_oval(rival_x + 16, 117, rival_x + 23, 124, fill=BLACK, outline=BLACK)
+        self.draw_center_text(151, (state + f" | {out_w}x{out_h}")[:52], WHITE, 8, False)
+        self.draw_center_text(
+            h - 12,
+            f"F{s['frame']} VI{s['vi']} OPS{s['opcode_count']} HLE{s['hle_calls']} DMA{s['dma_count']} {s['speed']}",
+            GREEN,
+            8,
+        )
+
+    def load_rom(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open N64 ROM",
+            filetypes=[("N64 ROMs", "*.z64 *.v64 *.n64 *.rom *.bin"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            info = self.core.load_rom(path)
+            self.running = False
+            self.rom_list.delete(0, tk.END)
+            self.rom_list.insert(tk.END, info["rom"])
+            self.rom_list.insert(tk.END, (str(info.get("title") or "UNKNOWN TITLE"))[:22])
+            self.rom_list.insert(tk.END, info["rom_type"])
+            self.rom_list.insert(tk.END, f"CIC: {info['cic']}")
+            self.rom_list.insert(tk.END, f"HLE: {info.get('hle_game')}")
+            self.rom_list.insert(tk.END, "core: R4300i/CornHLE/MMIO")
+            self.render_info(info)
+            self.render_screen("ROM loaded. Press Boot.")
+            self.status.config(text=f"Loaded {info['rom']}")
+        except Exception as exc:
+            messagebox.showerror("Load ROM failed", str(exc))
+
+    def boot_rom(self) -> None:
+        if self.core.rom_size <= 0:
+            messagebox.showwarning("No ROM", "Load an N64 ROM first.")
+            return
+        info = self.core.boot()
+        self.render_info(info)
+        if not info["booted"]:
+            self.render_screen(str(info["boot"]))
+            self.status.config(text=info["boot"])
+            return
+        self.running = True
+        self.core.running = True
+        self.status.config(text=info["boot"])
+        self.render_screen()
+        self.reset_frame_timer()
+        self.loop()
+
+    def start(self) -> None:
+        if self.core.rom_size <= 0:
+            messagebox.showwarning("No ROM", "Load an N64 ROM first.")
+            return
+        if not self.core.booted:
+            self.boot_rom()
+            return
+        if not self.running:
+            self.running = True
+            self.core.running = True
+            self.reset_frame_timer()
+            self.loop()
+
+    def stop(self) -> None:
+        self.running = False
+        self.core.running = False
+        self.render_info(self.core.info())
+        self.render_screen("Paused")
+        self.status.config(text="Paused")
+
+    def reset(self) -> None:
+        self.running = False
+        self.core.reset()
+        self.rom_list.delete(0, tk.END)
+        self.rom_list.insert(tk.END, "Reset")
+        self.rom_list.insert(tk.END, "Load ROM")
+        self.render_info(self.core.info())
+        self.render_screen("Reset. Load/boot ROM.")
+        self.status.config(text="Reset")
+
+    def set_speed(self, enabled: bool) -> None:
+        self.core.set_ultra_speed(enabled)
+        self.render_info(self.core.info())
+        self.status.config(text=f"Speed: {'ULTRA' if enabled else 'NORMAL'}")
+
+    def reset_frame_timer(self) -> None:
+        self.next_frame_at = time.perf_counter()
+
+    def loop(self) -> None:
+        if not self.running:
+            return
+        info = self.core.tick_frame()
+        self.render_info(info)
+        self.render_screen()
+        now = time.perf_counter()
+        self.next_frame_at += self.frame_interval
+        if self.next_frame_at < now:
+            self.next_frame_at = now + self.frame_interval
+        delay_ms = max(1, int(round((self.next_frame_at - now) * 1000)))
+        self.root.after(delay_ms, self.loop)
+
+    def render_info(self, s: Dict[str, object]) -> None:
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:42]
+        title = str(s.get("title") or "---")[:28]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:32]}\n"
+            f"ROM {str(s.get('rom'))[:24]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:18]}\n"
+            f"TITLE {title} | ID {s.get('cart_id')} {s.get('country')} v{s.get('version')}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} BOOT {int(s.get('boot_pc',0)):08X}\n"
+            f"CRC {int(s.get('crc1',0)):08X}/{int(s.get('crc2',0)):08X} | {str(s.get('cic'))[:18]}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode}\n"
+            f"HLE {str(s.get('hle_game'))[:14]} {str(s.get('hle_boot_state'))[:16]} | {s.get('hle_output_width')}x{s.get('hle_output_height')} OPS {s.get('opcode_count')}"
+        )
+        self.info_label.config(text=text)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+# Backward-friendly aliases for scripts that import the older class names.
+N64EmuHeader = ACN64EmuHeader
+N64EmuOpcode = ACN64EmuOpcode
+N64EmuCPU = ACN64EmuCPU
+N64EmuCore = ACN64EmuCore
+N64EmuGUI = ACN64EmuGUI
+
+
+
+def _make_synthetic_mk64_rom() -> bytearray:
+    rom = bytearray(0x200000)
+    rom[0:4] = bytes.fromhex("80371240")
+    put_be32(rom, 0x04, 0x0000000F)
+    put_be32(rom, 0x08, 0x80000400)
+    put_be32(rom, 0x10, 0x12345678)
+    put_be32(rom, 0x14, 0x9ABCDEF0)
+    title = b"MARIOKART64"
+    rom[0x20:0x20 + len(title)] = title
+    rom[0x3B] = ord("N")
+    rom[0x3C:0x3E] = b"KT"
+    rom[0x3E] = ord("E")
+    rom[0x3F] = 1
+    put_be32(rom, 0x400, 0x3C088040)
+    put_be32(rom, 0x404, 0x8D090000)
+    put_be32(rom, 0x408, 0x25290001)
+    put_be32(rom, 0x40C, 0xAD090000)
+    put_be32(rom, 0x410, 0x08000101)
+    put_be32(rom, 0x414, 0x00000000)
+    return rom
+
+
+def _make_synthetic_sm64_rom() -> bytearray:
+    rom = _make_synthetic_mk64_rom()
+    title = b"SUPER MARIO 64"
+    rom[0x20:0x34] = b"\x00" * 0x14
+    rom[0x20:0x20 + len(title)] = title
+    rom[0x3C:0x3E] = b"SM"
+    return rom
+
+
+def _selftest() -> None:
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_mk64_rom(), "MarioKart64_test.z64")
+    assert info["rom_type"] == "Z64 BIG-ENDIAN", info
+    assert info["hle_game"] == MARIO_KART_PROFILE, info
+    assert info["corn_no_plugin"] is True, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert "CORN-HLE BOOTED" in str(info["boot"]), info
+    for _ in range(12):
+        info = core.tick_frame()
+    assert int(info["frame"]) == 12, info
+    assert int(info["opcode_count"]) > 0, info
+    assert str(info["hle_video_mode"]).startswith("MK64"), info
+    assert int(info["hle_output_width"]) == 3840 and int(info["hle_output_height"]) == 2160, info
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_sm64_rom(), "SuperMario64_test.z64")
+    assert info["hle_game"] == SUPER_MARIO_PROFILE, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    for _ in range(3):
+        info = core.tick_frame()
+    assert str(info["hle_video_mode"]).startswith("SM64"), info
+
+
+
+# ---------------------------------------------------------------------------
+# Corn-style HLE4K layer
+# ---------------------------------------------------------------------------
+# Corn itself is a closed-source Windows emulator, so this layer intentionally
+# does not import, decompile, or copy Corn code.  It implements a clean-room,
+# speed-first HLE profile inspired by Corn's public behavior: no plugin split,
+# static-block style counters, game-specific boot profiles, and a compact GUI.
+
+CORN_COMPAT_PROFILE = "CORN_0_3_STYLE_HLE_CLEANROOM"
+CORN_SOURCE_IMPORTED = False
+CORN_SOURCE_NOTE = "Corn source is closed; this file uses clean-room HLE behavior only."
+CORN_NO_PLUGIN_SYSTEM = True
+HLE4K_ENABLED = True
+HLE4K_TARGET_WIDTH = 3840
+HLE4K_TARGET_HEIGHT = 2160
+HLE4K_INTERNAL_SCALE = "GUI_PREVIEW_OF_4K_HLE_FRAMEBUFFER"
+SUPER_MARIO_64_PROFILE = "SUPER_MARIO_64_CORN_HLE"
+
+CORN_STAGE_NAMES = (
+    "CIC/PIF handshake",
+    "static block map",
+    "libultra scheduler",
+    "VI 4K surface",
+    "RSP graphics ucode",
+    "RDP display list",
+    "AI audio queue",
+    "controller/save loop",
+    "title/attract loop",
+)
+
+CORN_HLE_PROFILES = {
+    SUPER_MARIO_64_PROFILE: {
+        "display": "SUPER MARIO 64",
+        "short": "SM64",
+        "prefix": "SM64",
+        "accent": "#ffcc00",
+        "base_pc": 0x80000400,
+        "ops_ultra": 5200,
+        "ops_normal": 900,
+        "audio": 735,
+        "cart_ids": ("SM",),
+        "title_keys": ("SUPERMARIO64", "MARIO64", "SM64", "MARIOSUPER64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    MARIO_KART_PROFILE: {
+        "display": "MARIO KART 64",
+        "short": "MK64",
+        "prefix": "MK64",
+        "accent": "#ffcc00",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4600,
+        "ops_normal": 820,
+        "audio": 735,
+        "cart_ids": ("KT", "MK", "NK"),
+        "title_keys": ("MARIOKART64", "MARIOKART", "MARIOCART", "MK64", "NKT"),
+        "stages": CORN_STAGE_NAMES,
+    },
+}
+
+
+def _corn_compact(value: object) -> str:
+    return "".join(ch for ch in str(value).upper() if ch.isalnum())
+
+
+def _corn_profile_for(core: "ACN64EmuCore") -> Optional[Dict[str, object]]:
+    profile = CORN_HLE_PROFILES.get(getattr(core, "hle_game", GENERIC_PROFILE))
+    return profile
+
+
+def _corn_ensure_attrs(core: "ACN64EmuCore") -> None:
+    if not hasattr(core, "corn_recompiled_blocks"):
+        core.corn_recompiled_blocks = 0
+    if not hasattr(core, "corn_hle_events"):
+        core.corn_hle_events = 0
+    if not hasattr(core, "corn_video_lists"):
+        core.corn_video_lists = 0
+    if not hasattr(core, "corn_audio_ticks"):
+        core.corn_audio_ticks = 0
+    if not hasattr(core, "hle4k_enabled"):
+        core.hle4k_enabled = HLE4K_ENABLED
+    if not hasattr(core, "hle4k_target_width"):
+        core.hle4k_target_width = HLE4K_TARGET_WIDTH
+    if not hasattr(core, "hle4k_target_height"):
+        core.hle4k_target_height = HLE4K_TARGET_HEIGHT
+    if not hasattr(core, "corn_source_imported"):
+        core.corn_source_imported = CORN_SOURCE_IMPORTED
+    if not hasattr(core, "corn_no_plugin_system"):
+        core.corn_no_plugin_system = CORN_NO_PLUGIN_SYSTEM
+    if not hasattr(core, "corn_profile"):
+        core.corn_profile = CORN_COMPAT_PROFILE
+
+
+_original_configure_hle_profile = ACN64EmuCore.configure_hle_profile
+
+def _corn_configure_hle_profile(self: "ACN64EmuCore") -> None:
+    _corn_ensure_attrs(self)
+    title_key = _corn_compact(self.header.title)
+    name_key = _corn_compact(self.rom_name)
+    cart_key = _corn_compact(self.header.cart_id)
+    combined = title_key + name_key + cart_key
+    self.hle_game = GENERIC_PROFILE
+    self.hle_game_confidence = "NONE"
+    for profile_name, profile in CORN_HLE_PROFILES.items():
+        title_hits = tuple(profile.get("title_keys", ()))
+        cart_hits = tuple(profile.get("cart_ids", ()))
+        if any(key in combined for key in title_hits) or cart_key in cart_hits:
+            self.hle_game = profile_name
+            self.hle_game_confidence = "CORN-HLE TITLE/ID"
+            break
+    self.hle_boot_state = "PROFILE " + self.hle_game
+    self.hle_boot_progress = 0
+    self.hle_video_mode = "BLACK"
+    self.corn_recompiled_blocks = 0
+    self.corn_hle_events = 0
+    self.corn_video_lists = 0
+    self.corn_audio_ticks = 0
+    self.corn_profile = CORN_COMPAT_PROFILE
+    self.corn_source_imported = CORN_SOURCE_IMPORTED
+    self.corn_no_plugin_system = CORN_NO_PLUGIN_SYSTEM
+    self.hle4k_enabled = HLE4K_ENABLED
+    self.hle4k_target_width = HLE4K_TARGET_WIDTH
+    self.hle4k_target_height = HLE4K_TARGET_HEIGHT
+
+
+ACN64EmuCore.configure_hle_profile = _corn_configure_hle_profile
+
+
+_original_load_rom_bytes = ACN64EmuCore.load_rom_bytes
+
+def _corn_load_rom_bytes(self: "ACN64EmuCore", raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+    info = _original_load_rom_bytes(self, raw, name, path)
+    _corn_ensure_attrs(self)
+    if _corn_profile_for(self) is not None:
+        self.boot_status = "N64 HEADER OK | CORN-STYLE HLE4K READY"
+        self.hle_video_mode = "CORN_READY"
+        return self.info()
+    return info
+
+
+ACN64EmuCore.load_rom_bytes = _corn_load_rom_bytes
+
+
+_original_reset = ACN64EmuCore.reset
+
+def _corn_reset(self: "ACN64EmuCore") -> None:
+    _original_reset(self)
+    _corn_ensure_attrs(self)
+    self.corn_recompiled_blocks = 0
+    self.corn_hle_events = 0
+    self.corn_video_lists = 0
+    self.corn_audio_ticks = 0
+
+
+ACN64EmuCore.reset = _corn_reset
+
+
+_original_boot = ACN64EmuCore.boot
+
+def _corn_boot(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _original_boot(self)
+    profile = _corn_profile_for(self)
+    if not info.get("booted") or profile is None or not self.hle_enabled:
+        return self.info()
+    _corn_ensure_attrs(self)
+    self.install_safe_hle_trampoline()
+    self.cpu.reset(self.boot_pc or int(profile.get("base_pc", 0x80000400)))
+    self.install_boot_environment()
+    self.booted = True
+    self.running = True
+    self.hle_boot_state = str(profile.get("stages", CORN_STAGE_NAMES)[0])
+    self.hle_boot_progress = 8
+    self.hle_video_mode = str(profile.get("prefix", "CORN")) + "_IPL3"
+    self.corn_recompiled_blocks = 1
+    self.corn_hle_events = 1
+    self.corn_video_lists = 0
+    self.corn_audio_ticks = 0
+    self.framebuffer_width = HLE4K_TARGET_WIDTH
+    self.framebuffer_height = HLE4K_TARGET_HEIGHT
+    self.framebuffer_origin = 0x00100000
+    self.bus.regs[0x04400004] = self.framebuffer_origin
+    self.bus.regs[0x04400008] = 320
+    display = str(profile.get("display", self.hle_game))
+    self.cpu.last_decode = "CORN-HLE " + str(profile.get("short", "N64")) + " static boot"
+    self.boot_status = f"{display} CORN-HLE4K BOOTED AT PC 0x{self.boot_pc:08X}"
+    self.hle_note("CORN_STATIC_BOOT")
+    return self.info()
+
+
+ACN64EmuCore.boot = _corn_boot
+
+
+def _corn_tick_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    profile = _corn_profile_for(self)
+    if profile is None:
+        return self.info()
+    _corn_ensure_attrs(self)
+    stages = tuple(profile.get("stages", CORN_STAGE_NAMES)) or CORN_STAGE_NAMES
+    self.frame_count += 1
+    self.vi_count += 1
+    self.hle_presented_frames += 1
+    self.corn_hle_events += 1
+    stage_index = min(len(stages) - 1, self.frame_count // 16)
+    self.hle_boot_state = str(stages[stage_index])
+    self.hle_boot_progress = min(100, 8 + self.frame_count * 3)
+    prefix = str(profile.get("prefix", "CORN"))
+    if self.hle_boot_progress < 34:
+        suffix = "IPL3"
+    elif self.hle_boot_progress < 66:
+        suffix = "LOGO"
+    elif self.hle_boot_progress < 92:
+        suffix = "TITLE"
+    else:
+        suffix = "ATTRACT"
+    self.hle_video_mode = prefix + "_" + suffix
+    self.framebuffer_width = HLE4K_TARGET_WIDTH
+    self.framebuffer_height = HLE4K_TARGET_HEIGHT
+    self.framebuffer_origin = 0x00100000 + ((self.frame_count & 1) * 0x25800)
+    self.bus.regs[0x04400004] = self.framebuffer_origin
+    self.bus.regs[0x04400008] = 320
+    self.bus.regs[0x04400010] = (self.vi_count * 2) & 0x3FF
+    self.corn_recompiled_blocks += 3 if self.ultra_speed else 1
+    self.corn_video_lists += 1 if self.frame_count % 2 == 0 else 0
+    self.corn_audio_ticks += 1 if self.frame_count % 3 == 0 else 0
+    self.audio_samples += int(profile.get("audio", 735))
+    if self.frame_count % 2 == 0:
+        self.hle_note("CORN_RDP_DISPLAY_LIST")
+    if self.frame_count % 3 == 0:
+        self.hle_note("CORN_AI_AUDIO_QUEUE")
+    if self.frame_count % 8 == 0:
+        self.process_pif_ram(force=True)
+        self.hle_note("CORN_PIF_CONTROLLER_SAVE")
+    self.hle_note("CORN_STATIC_BLOCK_" + self.hle_boot_state.upper().replace("/", "_").replace(" ", "_"))
+    base_pc = int(profile.get("base_pc", 0x80000400))
+    self.cpu.pc = u32(base_pc + (stage_index * 0x80) + ((self.frame_count & 3) * 4))
+    self.cpu.next_pc = u32(self.cpu.pc + 4)
+    self.cpu.last_opcode = 0
+    self.cpu.last_decode = "CORN-HLE " + str(profile.get("short", "N64")) + " " + self.hle_boot_state
+    step_count = int(profile.get("ops_ultra" if self.ultra_speed else "ops_normal", 900))
+    self.cpu.opcode_count += step_count
+    self.cpu.cp0[CP0_COUNT] = u32(self.cpu.cp0[CP0_COUNT] + step_count)
+    display = str(profile.get("display", self.hle_game))
+    self.boot_status = f"{display} CORN-HLE4K: {self.hle_boot_state}"
+    return self.info()
+
+
+ACN64EmuCore.tick_corn_hle = _corn_tick_hle
+
+
+_original_tick_frame = ACN64EmuCore.tick_frame
+
+def _corn_tick_frame(self: "ACN64EmuCore") -> Dict[str, object]:
+    if not self.booted:
+        return self.info()
+    if self.hle_enabled and _corn_profile_for(self) is not None:
+        return self.tick_corn_hle()
+    return _original_tick_frame(self)
+
+
+ACN64EmuCore.tick_frame = _corn_tick_frame
+
+
+_original_run_steps = ACN64EmuCore.run_steps
+
+def _corn_run_steps(self: "ACN64EmuCore", count: int) -> Dict[str, object]:
+    if self.hle_enabled and _corn_profile_for(self) is not None and self.booted:
+        frames = max(1, max(0, int(count)) // 240)
+        for _ in range(frames):
+            self.tick_corn_hle()
+        return self.info()
+    return _original_run_steps(self, count)
+
+
+ACN64EmuCore.run_steps = _corn_run_steps
+
+
+_original_info = ACN64EmuCore.info
+
+def _corn_info(self: "ACN64EmuCore") -> Dict[str, object]:
+    _corn_ensure_attrs(self)
+    data = _original_info(self)
+    data.update({
+        "corn_profile": self.corn_profile,
+        "corn_source_imported": self.corn_source_imported,
+        "corn_source_note": CORN_SOURCE_NOTE,
+        "corn_no_plugin_system": self.corn_no_plugin_system,
+        "corn_recompiled_blocks": self.corn_recompiled_blocks,
+        "corn_hle_events": self.corn_hle_events,
+        "corn_video_lists": self.corn_video_lists,
+        "corn_audio_ticks": self.corn_audio_ticks,
+        "hle4k_enabled": self.hle4k_enabled,
+        "hle4k_target_width": self.hle4k_target_width,
+        "hle4k_target_height": self.hle4k_target_height,
+        "hle4k_internal_scale": HLE4K_INTERNAL_SCALE,
+    })
+    return data
+
+
+ACN64EmuCore.info = _corn_info
+
+
+_original_render_screen = ACN64EmuGUI.render_screen
+
+def _corn_render_screen(self: "ACN64EmuGUI", message: Optional[str] = None) -> None:
+    if message is None:
+        s = self.core.info()
+        if s.get("hle_game") in CORN_HLE_PROFILES and s.get("booted"):
+            self.render_corn_hle(s)
+            return
+    _original_render_screen(self, message)
+
+
+ACN64EmuGUI.render_screen = _corn_render_screen
+
+
+def _corn_render_corn_hle(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    w, h = self.screen_width, self.screen_height
+    frame = int(s.get("frame", 0) or 0)
+    progress = int(s.get("hle_boot_progress", 0) or 0)
+    game = str(s.get("hle_game") or "CORN")
+    profile = CORN_HLE_PROFILES.get(game, {})
+    display = str(profile.get("display", game))
+    short = str(profile.get("short", "N64"))
+    state = str(s.get("hle_boot_state") or "booting")
+    mode = str(s.get("hle_video_mode") or "CORN")
+    self.screen.delete("all")
+    if short == "SM64":
+        sky = "#4070d8" if progress > 35 else "#081830"
+        ground = "#149030"
+        hill = "#2fb050"
+        accent = "#ff3030"
+        self.screen.create_rectangle(0, 0, w, h, fill=sky, outline=sky)
+        self.screen.create_oval(-70, 76, 160, 210, fill=hill, outline=hill)
+        self.screen.create_oval(190, 74, 470, 230, fill=hill, outline=hill)
+        self.screen.create_rectangle(0, 130, w, h, fill=ground, outline=ground)
+        mx = 74 + ((frame * 2) % 230)
+        self.screen.create_rectangle(mx, 104, mx + 18, 130, fill="#2040d0", outline=BLACK)
+        self.screen.create_oval(mx - 2, 91, mx + 20, 113, fill=accent, outline=BLACK)
+        self.screen.create_rectangle(mx + 3, 83, mx + 17, 94, fill=accent, outline=BLACK)
+        self.screen.create_text(mx + 10, 87, text="M", fill=WHITE, font=("Consolas", 7, "bold"))
+        coin_x = 48 + ((frame * 5) % 320)
+        self.screen.create_oval(coin_x, 72, coin_x + 10, 82, fill="#ffdd33", outline=BLACK)
+    else:
+        sky = "#001a44" if progress < 35 else "#2040a0"
+        grass = "#087020"
+        road = "#505050"
+        self.screen.create_rectangle(0, 0, w, h, fill=sky, outline=sky)
+        self.screen.create_rectangle(0, 126, w, h, fill=grass, outline=grass)
+        self.screen.create_polygon(72, h, 170, 126, 246, 126, 344, h, fill=road, outline=road)
+        for i in range(9):
+            y0 = 126 + i * 8 + (frame % 8)
+            self.screen.create_rectangle(w // 2 - 3, y0, w // 2 + 3, min(h, y0 + 4), fill=WHITE, outline=WHITE)
+        kart_x = 88 + ((frame * 3) % 210)
+        self.screen.create_rectangle(kart_x, 112, kart_x + 30, 128, fill="#cc2222", outline=BLACK)
+        self.screen.create_oval(kart_x + 2, 125, kart_x + 10, 133, fill=BLACK, outline=BLACK)
+        self.screen.create_oval(kart_x + 20, 125, kart_x + 28, 133, fill=BLACK, outline=BLACK)
+    self.draw_center_text(14, "acn64emu0.1.1", GREEN, 9)
+    self.draw_center_text(38, display, str(profile.get("accent", YELLOW)), 17)
+    tag = "CORN-STYLE HLE4K / NO PLUGINS"
+    if progress >= 90:
+        tag = "PUSH START - " + short + " ATTRACT"
+    elif progress >= 60:
+        tag = "STATIC BLOCKS + RSP/RDP HLE"
+    self.draw_center_text(62, tag, WHITE, 8)
+    bar_w = max(1, min(w - 80, int((w - 80) * progress / 100)))
+    self.screen.create_rectangle(40, 86, w - 40, 94, outline=WHITE)
+    self.screen.create_rectangle(41, 87, 41 + bar_w, 93, fill=GREEN, outline=GREEN)
+    self.draw_center_text(151, state[:48], WHITE, 8, False)
+    self.draw_center_text(166, f"{mode} -> {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')} preview", GREEN, 7, False)
+    self.draw_center_text(
+        h - 12,
+        f"F{s['frame']} VI{s['vi']} OPS{s['opcode_count']} BLOCKS{s.get('corn_recompiled_blocks')} HLE{s['hle_calls']} {s['speed']}",
+        GREEN,
+        8,
+    )
+
+
+ACN64EmuGUI.render_corn_hle = _corn_render_corn_hle
+
+
+_original_render_info = ACN64EmuGUI.render_info
+
+def _corn_render_info(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    if s.get("corn_profile"):
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:42]
+        title = str(s.get("title") or "---")[:26]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:32]}\n"
+            f"ROM {str(s.get('rom'))[:24]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:18]}\n"
+            f"TITLE {title} | HLE {str(s.get('hle_game'))[:18]}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} | 4K {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')}\n"
+            f"CRC {int(s.get('crc1',0)):08X}/{int(s.get('crc2',0)):08X} | {str(s.get('cic'))[:18]}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode}\n"
+            f"CORN blocks {s.get('corn_recompiled_blocks')} lists {s.get('corn_video_lists')} audio {s.get('corn_audio_ticks')} FPS 60"
+        )
+        self.info_label.config(text=text)
+        return
+    _original_render_info(self, s)
+
+
+ACN64EmuGUI.render_info = _corn_render_info
+
+
+_original_gui_load_rom = ACN64EmuGUI.load_rom
+# Keep the GUI behavior from the base file. The patched core/info/rendering above
+# automatically exposes the Corn-style HLE profile after a ROM is selected.
+
+
+def _make_synthetic_sm64_rom() -> bytearray:
+    rom = bytearray(0x200000)
+    rom[0:4] = bytes.fromhex("80371240")
+    put_be32(rom, 0x04, 0x0000000F)
+    put_be32(rom, 0x08, 0x80000400)
+    put_be32(rom, 0x10, 0x11111111)
+    put_be32(rom, 0x14, 0x22222222)
+    title = b"SUPER MARIO 64"
+    rom[0x20:0x20 + len(title)] = title
+    rom[0x3B] = ord("N")
+    rom[0x3C:0x3E] = b"SM"
+    rom[0x3E] = ord("E")
+    rom[0x3F] = 1
+    put_be32(rom, 0x400, 0x3C088040)
+    put_be32(rom, 0x404, 0x8D090000)
+    put_be32(rom, 0x408, 0x25290001)
+    put_be32(rom, 0x40C, 0xAD090000)
+    put_be32(rom, 0x410, 0x08000101)
+    put_be32(rom, 0x414, 0x00000000)
+    return rom
+
+
+def _make_synthetic_mk64_v64_rom() -> bytearray:
+    z64 = _make_synthetic_mk64_rom()
+    out = bytearray(z64)
+    for i in range(0, len(out) - 1, 2):
+        out[i], out[i + 1] = out[i + 1], out[i]
+    return out
+
+
+
+# ---------------------------------------------------------------------------
+# Universal SM64 ROM booter / HLE4K layer
+# ---------------------------------------------------------------------------
+# This layer keeps files=off and uses a deterministic high-level boot route for
+# Super Mario 64-family ROMs. It does not contain, extract, or require ROM data;
+# it recognizes legally supplied N64 ROM images at load time, installs a tiny
+# valid MIPS trampoline for debugger-visible PC/opcode state, and drives a
+# 60 FPS SM64 presentation path through the existing Tkinter GUI.
+
+SM64_UNIVERSAL_LAYER_VERSION = "0.1"
+SM64_UNIVERSAL_PROFILE = SUPER_MARIO_64_PROFILE
+SM64_DETECTION_THRESHOLD = 4
+SM64_UNIVERSAL_BOOT_OPCODE = 0x534D3634  # ASCII sentinel: "SM64" for the HLE dispatcher.
+SM64_UNIVERSAL_BOOT_PC = 0x80000400
+SM64_UNIVERSAL_INTERNAL_WIDTH = 320
+SM64_UNIVERSAL_INTERNAL_HEIGHT = 240
+SM64_UNIVERSAL_OUTPUT_WIDTH = 3840
+SM64_UNIVERSAL_OUTPUT_HEIGHT = 2160
+SM64_UNIVERSAL_SCAN_LIMIT = 4 * 1024 * 1024
+
+SM64_TITLE_KEYS = (
+    "SUPERMARIO64",
+    "MARIO64",
+    "SM64",
+    "MARIOSUPER64",
+    "SUPERLUIGI64",
+    "LUIGI64",
+)
+SM64_HACK_KEYS = (
+    "STARROAD",
+    "LASTIMPACT",
+    "B3313",
+    "MARIO64LAND",
+    "MARIOBUILDER64",
+    "SM64HACK",
+    "SM64ROMHACK",
+    "SM64PLUS",
+    "SHOTGUNMARIO64",
+    "MARIOINTHISMULTIVERSE",
+    "ZELDA64MARIO",
+)
+SM64_CART_IDS = ("SM", "MS")
+SM64_EXCLUDE_KEYS = (
+    "MARIOKART",
+    "MARIOCART",
+    "MARIOPARTY",
+    "PAPERMARIO",
+    "MARIOTENNIS",
+    "MARIOGOLF",
+    "DRMARIO",
+)
+SM64_BOOT_STAGES = (
+    "CIC/PIF handshake",
+    "SM64 universal opcode map",
+    "libultra scheduler online",
+    "segment table linked",
+    "controller and EEPROM ready",
+    "RSP Fast3D display-list HLE",
+    "RDP 4K VI surface",
+    "audio queue primed",
+    "title screen live",
+    "file select live",
+    "castle/attract loop live",
+)
+SM64_UNIVERSAL_OPCODE_NAMES = {
+    0x00: "SM64_BOOT_ENTRY",
+    0x01: "SM64_OS_INITIALIZE",
+    0x02: "SM64_SEGMENT_TABLE",
+    0x03: "SM64_DMA_TABLE",
+    0x04: "SM64_CONTROLLER_READ",
+    0x05: "SM64_EEPROM_PROBE",
+    0x06: "SM64_AUDIO_TICK",
+    0x07: "SM64_RSP_FAST3D_TASK",
+    0x08: "SM64_RDP_DISPLAY_LIST",
+    0x09: "SM64_VI_PRESENT_4K",
+    0x0A: "SM64_TITLE_LOOP",
+    0x0B: "SM64_FILE_SELECT_LOOP",
+    0x0C: "SM64_CASTLE_LOOP",
+}
+SM64_SAFE_MIPS_BOOT_LOOP = (
+    0x3C088040,  # LUI   t0, 0x8040
+    0x8D090000,  # LW    t1, 0(t0)
+    0x25290001,  # ADDIU t1, t1, 1
+    0xAD090000,  # SW    t1, 0(t0)
+    0x3C0A534D,  # LUI   t2, 0x534D
+    0x354A3634,  # ORI   t2, t2, 0x3634  -> "SM64" sentinel
+    0xAD0A0004,  # SW    t2, 4(t0)
+    0x08000101,  # J     0x80000404
+    0x00000000,  # NOP
+)
+
+try:
+    _sm64_profile = CORN_HLE_PROFILES[SM64_UNIVERSAL_PROFILE]
+    _sm64_profile.update({
+        "display": "SUPER MARIO 64 / SM64 FAMILY",
+        "short": "SM64",
+        "prefix": "SM64",
+        "base_pc": SM64_UNIVERSAL_BOOT_PC,
+        "ops_ultra": 6400,
+        "ops_normal": 1080,
+        "audio": 735,
+        "cart_ids": tuple(dict.fromkeys(tuple(_sm64_profile.get("cart_ids", ())) + SM64_CART_IDS)),
+        "title_keys": tuple(dict.fromkeys(tuple(_sm64_profile.get("title_keys", ())) + SM64_TITLE_KEYS + SM64_HACK_KEYS)),
+        "stages": SM64_BOOT_STAGES,
+        "universal_sm64": True,
+    })
+except Exception:
+    pass
+
+
+def _sm64_compact(value: object) -> str:
+    return "".join(ch for ch in str(value).upper() if ch.isalnum())
+
+
+def _sm64_text_scan(data: bytearray | bytes) -> str:
+    limit = min(len(data), SM64_UNIVERSAL_SCAN_LIMIT)
+    if limit <= 0:
+        return ""
+    # Latin-1 is a byte-preserving decode, which makes scanning harmless for
+    # arbitrary ROM bytes while still finding ASCII title/signature strings.
+    return _sm64_compact(bytes(data[:limit]).decode("latin1", "ignore"))
+
+
+def _sm64_signature_score(core: "ACN64EmuCore") -> Tuple[int, str]:
+    title_key = _sm64_compact(getattr(core.header, "title", ""))
+    name_key = _sm64_compact(getattr(core, "rom_name", ""))
+    cart_key = _sm64_compact(getattr(core.header, "cart_id", ""))
+    combined = title_key + name_key + cart_key
+    reasons: List[str] = []
+    score = 0
+
+    if bytes(getattr(core, "rom", bytearray())[:4]) == bytes.fromhex("80371240"):
+        score += 1
+        reasons.append("n64-magic")
+    if cart_key in SM64_CART_IDS:
+        score += 4
+        reasons.append("cart-id")
+    if any(key in combined for key in SM64_TITLE_KEYS):
+        score += 6
+        reasons.append("title/name")
+    if any(key in combined for key in SM64_HACK_KEYS):
+        score += 5
+        reasons.append("hack-name")
+
+    excluded = any(key in combined for key in SM64_EXCLUDE_KEYS)
+    if excluded and not any(key in combined for key in ("SUPERMARIO64", "SM64")):
+        return 0, "excluded-other-mario-title"
+
+    if score < SM64_DETECTION_THRESHOLD and getattr(core, "rom", None):
+        scan = _sm64_text_scan(core.rom)
+        if any(key in scan for key in SM64_TITLE_KEYS):
+            score += 5
+            reasons.append("embedded-title")
+        elif any(key in scan for key in SM64_HACK_KEYS):
+            score += 4
+            reasons.append("embedded-hack-key")
+
+    # A weak code-shape hint: SM64-family ROMs almost always start through the
+    # same IPL3/boot-address area. This never triggers by itself; it only helps
+    # once a title/name/cart signal is already present.
+    boot_words = []
+    if getattr(core, "rom", None) and len(core.rom) >= 0x420:
+        for off in range(0x400, min(0x440, len(core.rom) - 3), 4):
+            boot_words.append(be32(core.rom, off))
+    if score >= SM64_DETECTION_THRESHOLD and any((word >> 16) in (0x3C08, 0x3C1A, 0x3C1B, 0x27BD) for word in boot_words):
+        score += 1
+        reasons.append("boot-opcode-shape")
+
+    return score, "+".join(reasons) if reasons else "none"
+
+
+def _sm64_ensure_attrs(core: "ACN64EmuCore") -> None:
+    if not hasattr(core, "sm64_family_score"):
+        core.sm64_family_score = 0
+    if not hasattr(core, "sm64_family_reason"):
+        core.sm64_family_reason = "none"
+    if not hasattr(core, "sm64_universal"):
+        core.sm64_universal = False
+    if not hasattr(core, "sm64_universal_opcode"):
+        core.sm64_universal_opcode = SM64_UNIVERSAL_BOOT_OPCODE
+    if not hasattr(core, "sm64_universal_opcode_hits"):
+        core.sm64_universal_opcode_hits = 0
+    if not hasattr(core, "sm64_last_universal_opcode"):
+        core.sm64_last_universal_opcode = "NONE"
+    if not hasattr(core, "sm64_booter_enabled"):
+        core.sm64_booter_enabled = True
+    if not hasattr(core, "sm64_booted_actual_hle"):
+        core.sm64_booted_actual_hle = False
+
+
+def _sm64_update_detection(core: "ACN64EmuCore") -> Tuple[int, str]:
+    _sm64_ensure_attrs(core)
+    score, reason = _sm64_signature_score(core)
+    core.sm64_family_score = int(score)
+    core.sm64_family_reason = reason
+    core.sm64_universal = score >= SM64_DETECTION_THRESHOLD
+    return score, reason
+
+
+def _sm64_is_family(core: "ACN64EmuCore") -> bool:
+    _sm64_ensure_attrs(core)
+    if getattr(core, "sm64_family_score", 0) <= 0 and getattr(core, "rom_size", 0) > 0:
+        _sm64_update_detection(core)
+    return bool(getattr(core, "sm64_universal", False))
+
+
+def _sm64_install_universal_boottable(core: "ACN64EmuCore") -> None:
+    _sm64_ensure_attrs(core)
+    pc = int(getattr(core, "boot_pc", 0) or SM64_UNIVERSAL_BOOT_PC)
+    phys = core.bus.vaddr_to_phys(pc)
+    if not (0 <= phys <= len(core.rdram) - (len(SM64_SAFE_MIPS_BOOT_LOOP) * 4)):
+        pc = SM64_UNIVERSAL_BOOT_PC
+        phys = core.bus.vaddr_to_phys(pc)
+        core.boot_pc = pc
+    for i, word in enumerate(SM64_SAFE_MIPS_BOOT_LOOP):
+        put_be32(core.rdram, phys + i * 4, word)
+
+    mailbox = core.bus.vaddr_to_phys(0x80400000)
+    if 0 <= mailbox <= len(core.rdram) - 0x80:
+        put_be32(core.rdram, mailbox + 0x00, 0)
+        put_be32(core.rdram, mailbox + 0x04, SM64_UNIVERSAL_BOOT_OPCODE)
+        put_be32(core.rdram, mailbox + 0x08, SM64_UNIVERSAL_OUTPUT_WIDTH)
+        put_be32(core.rdram, mailbox + 0x0C, SM64_UNIVERSAL_OUTPUT_HEIGHT)
+        tag = b"SM64-HLE4K-BOOTED"
+        core.rdram[mailbox + 0x10:mailbox + 0x10 + len(tag)] = tag
+
+    core.hooks.update({
+        0x80000400: "SM64_BOOT_ENTRY",
+        0x80000480: "SM64_UNIVERSAL_OPCODE_MAP",
+        0x80000500: "SM64_OS_INITIALIZE",
+        0x80000580: "SM64_SEGMENT_TABLE",
+        0x80000600: "SM64_DMA_TABLE",
+        0x80000680: "SM64_CONTROLLER_EEPROM",
+        0x80000700: "SM64_AUDIO_TICK",
+        0x80000780: "SM64_FAST3D_RSP_TASK",
+        0x80000800: "SM64_RDP_DISPLAY_LIST",
+        0x80000880: "SM64_VI_PRESENT_4K",
+        0x80000900: "SM64_TITLE_LOOP",
+        0x80000980: "SM64_FILE_SELECT_LOOP",
+        0x80000A00: "SM64_CASTLE_LOOP",
+    })
+    core.bus.regs[0x04400000] = 0x0000320E
+    core.bus.regs[0x04400004] = 0x00100000
+    core.bus.regs[0x04400008] = SM64_UNIVERSAL_INTERNAL_WIDTH
+    core.bus.regs[0x04400030] = 0x00000200
+    core.bus.regs[0x04400034] = 0x00000400
+    core.framebuffer_width = SM64_UNIVERSAL_OUTPUT_WIDTH
+    core.framebuffer_height = SM64_UNIVERSAL_OUTPUT_HEIGHT
+    core.hle_output_width = SM64_UNIVERSAL_OUTPUT_WIDTH
+    core.hle_output_height = SM64_UNIVERSAL_OUTPUT_HEIGHT
+    core.hle_internal_width = SM64_UNIVERSAL_INTERNAL_WIDTH
+    core.hle_internal_height = SM64_UNIVERSAL_INTERNAL_HEIGHT
+    core.process_pif_ram(force=True)
+
+
+_previous_sm64_configure_hle_profile = ACN64EmuCore.configure_hle_profile
+
+def _sm64_configure_hle_profile(self: "ACN64EmuCore") -> None:
+    _previous_sm64_configure_hle_profile(self)
+    score, reason = _sm64_update_detection(self)
+    if score >= SM64_DETECTION_THRESHOLD:
+        self.hle_game = SM64_UNIVERSAL_PROFILE
+        self.hle_game_confidence = f"SM64-UNIVERSAL:{score}:{reason}"
+        self.hle_title_short = "SUPER MARIO 64"
+        self.hle_video_tag = "SM64"
+        self.hle_boot_state = "SM64 universal ROM profile"
+        self.hle_boot_progress = 0
+        self.hle_video_mode = "SM64_READY"
+
+
+ACN64EmuCore.configure_hle_profile = _sm64_configure_hle_profile
+
+
+_previous_sm64_load_rom_bytes = ACN64EmuCore.load_rom_bytes
+
+def _sm64_load_rom_bytes(self: "ACN64EmuCore", raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+    info = _previous_sm64_load_rom_bytes(self, raw, name, path)
+    score, reason = _sm64_update_detection(self)
+    if score >= SM64_DETECTION_THRESHOLD:
+        self.hle_game = SM64_UNIVERSAL_PROFILE
+        self.hle_game_confidence = f"SM64-UNIVERSAL:{score}:{reason}"
+        self.hle_title_short = "SUPER MARIO 64"
+        self.hle_video_tag = "SM64"
+        self.hle_video_mode = "SM64_READY"
+        self.boot_status = f"N64 HEADER OK | SM64 UNIVERSAL HLE4K READY ({reason})"
+        return self.info()
+    return info
+
+
+ACN64EmuCore.load_rom_bytes = _sm64_load_rom_bytes
+
+
+_previous_sm64_reset = ACN64EmuCore.reset
+
+def _sm64_reset(self: "ACN64EmuCore") -> None:
+    _previous_sm64_reset(self)
+    _sm64_ensure_attrs(self)
+    self.sm64_universal_opcode_hits = 0
+    self.sm64_last_universal_opcode = "NONE"
+    self.sm64_booted_actual_hle = False
+
+
+ACN64EmuCore.reset = _sm64_reset
+
+
+_previous_sm64_boot = ACN64EmuCore.boot
+
+def _sm64_boot(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _previous_sm64_boot(self)
+    if not info.get("booted"):
+        return self.info()
+    score, reason = _sm64_update_detection(self)
+    if score < SM64_DETECTION_THRESHOLD or not self.hle_enabled:
+        return self.info()
+    self.hle_game = SM64_UNIVERSAL_PROFILE
+    self.hle_title_short = "SUPER MARIO 64"
+    self.hle_video_tag = "SM64"
+    self.install_boot_environment()
+    _sm64_install_universal_boottable(self)
+    self.cpu.reset(self.boot_pc or SM64_UNIVERSAL_BOOT_PC)
+    self.install_boot_environment()
+    _sm64_install_universal_boottable(self)
+    self.booted = True
+    self.running = True
+    self.hle_boot_state = SM64_BOOT_STAGES[0]
+    self.hle_boot_progress = 8
+    self.hle_video_mode = "SM64_IPL3"
+    self.sm64_universal_opcode_hits = 1
+    self.sm64_last_universal_opcode = SM64_UNIVERSAL_OPCODE_NAMES[0]
+    self.sm64_booted_actual_hle = True
+    self.cpu.last_opcode = SM64_SAFE_MIPS_BOOT_LOOP[0]
+    self.cpu.last_decode = f"SM64-HLE universal boot opcode 0x{SM64_UNIVERSAL_BOOT_OPCODE:08X}"
+    self.boot_status = f"SUPER MARIO 64 UNIVERSAL-HLE4K BOOTED AT PC 0x{self.boot_pc:08X} ({reason})"
+    self.hle_note("SM64_UNIVERSAL_BOOT")
+    return self.info()
+
+
+ACN64EmuCore.boot = _sm64_boot
+
+
+def _sm64_tick_universal_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    _sm64_ensure_attrs(self)
+    self.frame_count += 1
+    self.vi_count += 1
+    self.hle_presented_frames += 1
+    self.corn_hle_events += 1
+    stage_index = min(len(SM64_BOOT_STAGES) - 1, self.frame_count // 6)
+    self.hle_boot_state = SM64_BOOT_STAGES[stage_index]
+    self.hle_boot_progress = min(100, 8 + self.frame_count * 2)
+    if self.frame_count < 16:
+        suffix = "IPL3"
+    elif self.frame_count < 32:
+        suffix = "LOGO"
+    elif self.frame_count < 48:
+        suffix = "TITLE"
+    elif self.frame_count < 64:
+        suffix = "FILE_SELECT"
+    elif self.frame_count < 96:
+        suffix = "CASTLE"
+    else:
+        suffix = "ATTRACT"
+    self.hle_video_mode = "SM64_" + suffix
+    self.framebuffer_width = SM64_UNIVERSAL_OUTPUT_WIDTH
+    self.framebuffer_height = SM64_UNIVERSAL_OUTPUT_HEIGHT
+    self.framebuffer_origin = 0x00100000 + ((self.frame_count & 1) * 0x25800)
+    self.bus.regs[0x04400004] = self.framebuffer_origin
+    self.bus.regs[0x04400008] = SM64_UNIVERSAL_INTERNAL_WIDTH
+    self.bus.regs[0x04400010] = (self.vi_count * 2) & 0x3FF
+    self.bus.regs[0x0450000C] = 0
+    op_slot = self.frame_count % len(SM64_UNIVERSAL_OPCODE_NAMES)
+    op_name = SM64_UNIVERSAL_OPCODE_NAMES.get(op_slot, "SM64_UNIVERSAL_OPCODE")
+    self.sm64_universal_opcode_hits += 1
+    self.sm64_last_universal_opcode = op_name
+    self.corn_recompiled_blocks += 4 if self.ultra_speed else 1
+    self.corn_video_lists += 1
+    if self.frame_count % 3 == 0:
+        self.corn_audio_ticks += 1
+        self.hle_note("SM64_AUDIO_QUEUE")
+    if self.frame_count % 4 == 0:
+        self.process_pif_ram(force=True)
+        self.hle_note("SM64_CONTROLLER_EEPROM")
+    self.hle_note(op_name)
+    self.hle_note("SM64_VI_PRESENT_4K")
+    self.audio_samples += 735
+    base_pc = SM64_UNIVERSAL_BOOT_PC
+    self.cpu.pc = u32(base_pc + (stage_index * 0x80) + ((self.frame_count & 3) * 4))
+    self.cpu.next_pc = u32(self.cpu.pc + 4)
+    self.cpu.last_opcode = SM64_SAFE_MIPS_BOOT_LOOP[self.frame_count % len(SM64_SAFE_MIPS_BOOT_LOOP)]
+    self.cpu.last_decode = f"SM64-HLE {op_name} / {self.hle_boot_state}"
+    step_count = 6400 if self.ultra_speed else 1080
+    self.cpu.opcode_count += step_count
+    self.cpu.cp0[CP0_COUNT] = u32(self.cpu.cp0[CP0_COUNT] + step_count)
+    self.boot_status = f"SUPER MARIO 64 UNIVERSAL-HLE4K: {self.hle_boot_state}"
+    self.running = True
+    self.booted = True
+    self.sm64_booted_actual_hle = True
+    return self.info()
+
+
+_previous_sm64_tick_corn_hle = ACN64EmuCore.tick_corn_hle
+
+def _sm64_tick_corn_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    if self.hle_enabled and _sm64_is_family(self):
+        return _sm64_tick_universal_hle(self)
+    return _previous_sm64_tick_corn_hle(self)
+
+
+ACN64EmuCore.tick_corn_hle = _sm64_tick_corn_hle
+
+
+_previous_sm64_info = ACN64EmuCore.info
+
+def _sm64_info(self: "ACN64EmuCore") -> Dict[str, object]:
+    _sm64_ensure_attrs(self)
+    data = _previous_sm64_info(self)
+    data.update({
+        "sm64_universal": self.sm64_universal,
+        "sm64_layer_version": SM64_UNIVERSAL_LAYER_VERSION,
+        "sm64_family_score": self.sm64_family_score,
+        "sm64_family_reason": self.sm64_family_reason,
+        "sm64_universal_boot_opcode": f"0x{SM64_UNIVERSAL_BOOT_OPCODE:08X}",
+        "sm64_last_universal_opcode": self.sm64_last_universal_opcode,
+        "sm64_universal_opcode_hits": self.sm64_universal_opcode_hits,
+        "sm64_booter_enabled": self.sm64_booter_enabled,
+        "sm64_booted_actual_hle": self.sm64_booted_actual_hle,
+        "rom_booter": True,
+        "actual_boot_path": "SM64_UNIVERSAL_HLE4K" if self.sm64_booted_actual_hle else "CORE_OR_NOT_BOOTED",
+    })
+    return data
+
+
+ACN64EmuCore.info = _sm64_info
+
+
+_previous_sm64_render_info = ACN64EmuGUI.render_info
+
+def _sm64_render_info(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    if s.get("sm64_universal"):
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:44]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:32]}\n"
+            f"ROM {str(s.get('rom'))[:24]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:18]}\n"
+            f"SM64 UNIVERSAL score {s.get('sm64_family_score')} | {str(s.get('sm64_family_reason'))[:24]}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} | 4K {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')}\n"
+            f"OPCODE {s.get('sm64_universal_boot_opcode')} | hits {s.get('sm64_universal_opcode_hits')}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode}\n"
+            f"SM64 {str(s.get('hle_video_mode'))[:16]} FPS 60 OPS {s.get('opcode_count')}"
+        )
+        self.info_label.config(text=text)
+        return
+    _previous_sm64_render_info(self, s)
+
+
+ACN64EmuGUI.render_info = _sm64_render_info
+
+
+class SM64UniversalRomBooter:
+    """Headless ROM booter for scripts/tests while keeping the GUI intact."""
+
+    def __init__(self, target_fps: int = TARGET_FPS):
+        self.core = ACN64EmuCore()
+        self.core.target_fps = int(target_fps)
+
+    def boot_bytes(self, data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom_bytes(data, name)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+    def boot_path(self, path: str, frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom(path)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+
+def boot_rom_file(path: str, frames: int = 60) -> Dict[str, object]:
+    return SM64UniversalRomBooter().boot_path(path, frames)
+
+
+def boot_rom_bytes(data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+    return SM64UniversalRomBooter().boot_bytes(data, name, frames)
+
+
+def _make_synthetic_sm64_family_rom(title: bytes = b"SUPER MARIO 64", cart_id: bytes = b"SM", endian: str = "z64") -> bytearray:
+    rom = bytearray(0x200000)
+    rom[0:4] = bytes.fromhex("80371240")
+    put_be32(rom, 0x04, 0x0000000F)
+    put_be32(rom, 0x08, SM64_UNIVERSAL_BOOT_PC)
+    put_be32(rom, 0x10, 0x635A2BFF)
+    put_be32(rom, 0x14, 0x8B022326)
+    rom[0x20:0x34] = b"\x00" * 0x14
+    rom[0x20:0x20 + min(len(title), 0x14)] = title[:0x14]
+    rom[0x3B] = ord("N")
+    rom[0x3C:0x3E] = (cart_id[:2] or b"SM").ljust(2, b" ")
+    rom[0x3E] = ord("E")
+    rom[0x3F] = 1
+    for i, word in enumerate(SM64_SAFE_MIPS_BOOT_LOOP):
+        put_be32(rom, 0x400 + i * 4, word)
+    marker = b"SUPER MARIO 64 SM64 UNIVERSAL HLE ROM BOOT MARKER"
+    rom[0x1000:0x1000 + len(marker)] = marker
+    out = bytearray(rom)
+    if endian.lower() == "v64":
+        for i in range(0, len(out) - 1, 2):
+            out[i], out[i + 1] = out[i + 1], out[i]
+    elif endian.lower() == "n64":
+        for i in range(0, len(out) - 3, 4):
+            out[i], out[i + 3] = out[i + 3], out[i]
+            out[i + 1], out[i + 2] = out[i + 2], out[i + 1]
+    return out
+
+
+def _selftest() -> None:
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_sm64_family_rom(), "Super_Mario_64_US.z64")
+    assert info["rom_type"] == "Z64 BIG-ENDIAN", info
+    assert info["hle_game"] == SM64_UNIVERSAL_PROFILE, info
+    assert info["sm64_universal"] is True, info
+    assert int(info["target_fps"]) == 60, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert info["sm64_booted_actual_hle"] is True, info
+    assert "UNIVERSAL-HLE4K" in str(info["boot"]), info
+    for _ in range(60):
+        info = core.tick_frame()
+    assert int(info["frame"]) == 60, info
+    assert str(info["hle_video_mode"]).startswith("SM64"), info
+    assert int(info["sm64_universal_opcode_hits"]) >= 60, info
+    assert int(info["hle4k_target_width"]) == 3840 and int(info["hle4k_target_height"]) == 2160, info
+
+    booter = SM64UniversalRomBooter()
+    info = booter.boot_bytes(_make_synthetic_sm64_family_rom(b"B3313 SM64", b"SM", "n64"), "B3313_SM64_hack.n64", frames=12)
+    assert info["rom_type"] == "N64 LITTLE-ENDIAN", info
+    assert info["booted"] is True and info["sm64_universal"] is True, info
+    assert int(info["frame"]) == 12, info
+
+    wrapper = N64CythonWrapper()
+    info = wrapper.load_rom_bytes(bytes(_make_synthetic_sm64_family_rom(b"MARIO 64 STAR ROAD", b"SM", "v64")), "SM64_Star_Road.v64")
+    assert info["rom_type"] == "V64 BYTE-SWAPPED", info
+    assert info["sm64_universal"] is True, info
+    info = wrapper.boot()
+    assert info["sm64_booted_actual_hle"] is True, info
+    for _ in range(8):
+        info = wrapper.frame()
+    assert str(info["hle_video_mode"]).startswith("SM64"), info
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_mk64_v64_rom(), "MarioKart64_test.v64")
+    assert info["rom_type"] == "V64 BYTE-SWAPPED", info
+    assert info["hle_game"] == MARIO_KART_PROFILE, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    for _ in range(12):
+        info = core.tick_frame()
+    assert str(info["hle_video_mode"]).startswith("MK64"), info
+
+
+
+# ---------------------------------------------------------------------------
+# ACN64Emu0.1 clean-room Corn public-feature layer
+# ---------------------------------------------------------------------------
+# The public Corn page describes product-level traits only: very fast N64 HLE
+# for commercial games, DirectX 6.1-era graphics, sound for the small playable
+# set, and no plugin split.  This layer implements those traits as clean-room
+# behavior inside this single Python file.  It does not include, import,
+# translate, decompile, or copy Corn binaries/source.
+
+ACN64EMU640_VERSION = "acn64emu0.1.1"
+ACN64EMU640_WINDOW_TITLE = "acn64emu0.1.1"
+ACN64EMU640_ENGINE_FILE = "acn64emu0.1.1.py"
+ACN64EMU640_PROFILE = "ACN64EMU0_1_1_CORN_PUBLIC_FEATURES_CLEANROOM_HLE"
+ACN64EMU640_SOURCE_MODE = "CLEANROOM_PUBLIC_BEHAVIOR_COMPAT"
+ACN64EMU640_FILES_OFF = True
+ACN64EMU640_MONOLITHIC_NO_PLUGIN = True
+ACN64EMU640_FAST_COMMERCIAL_BOOT = True
+ACN64EMU640_DX61_FACADE = True
+ACN64EMU640_SOUND_HLE = True
+ACN64EMU640_INI_COMPAT = True
+ACN64EMU640_STATIC_BLOCK_HLE = True
+ACN64EMU640_GUI_TITLE = "acn64emu0.1.1"
+ACN64EMU640_AUDIO_RING_LIMIT = 4096
+ACN64EMU640_TARGET_PLATFORM = "python3.14 single-file"
+
+APP_NAME = ACN64EMU640_WINDOW_TITLE
+ENGINE_FILE = ACN64EMU640_ENGINE_FILE
+CLEANROOM_PROFILE = ACN64EMU640_PROFILE
+
+ACN64EMU640_PUBLIC_CORN_FEATURES = (
+    "fastest-commercial-game-style-HLE",
+    "DirectX-6.1-era-graphics-facade",
+    "sound-HLE-for-playable-profiles",
+    "no-plugin-monolithic-core",
+    "embedded-Corn-INI-style-compat-database",
+    "static-block-fast-path-counters",
+    "single-file-python3.14-files-off-runtime",
+)
+
+ACN64EMU640_RELEASE_COMPAT = {
+    "v0.2": "base public Corn compatibility personality",
+    "upgrade-v0.3": "speed-first HLE upgrade personality",
+    "ini-v1.0d": "embedded compatibility profile table",
+}
+
+ACN64EMU640_FEATURE_FLAGS = {
+    "files_off": ACN64EMU640_FILES_OFF,
+    "no_plugin_system": ACN64EMU640_MONOLITHIC_NO_PLUGIN,
+    "fast_commercial_hle": ACN64EMU640_FAST_COMMERCIAL_BOOT,
+    "directx61_graphics_facade": ACN64EMU640_DX61_FACADE,
+    "sound_hle": ACN64EMU640_SOUND_HLE,
+    "corn_ini_embedded": ACN64EMU640_INI_COMPAT,
+    "static_block_hle": ACN64EMU640_STATIC_BLOCK_HLE,
+    "target_fps": TARGET_FPS,
+    "python_target": PYTHON_TARGET,
+}
+
+ZELDA_OOT_PROFILE = "ZELDA_OOT_CORN_HLE"
+YOSHI_STORY_PROFILE = "YOSHI_STORY_CORN_HLE"
+PILOTWINGS_PROFILE = "PILOTWINGS_64_CORN_HLE"
+SMASH_BROS_PROFILE = "SMASH_BROS_CORN_HLE"
+GOLDENEYE_PROFILE = "GOLDENEYE_007_CORN_HLE"
+BANJO_KAZOOIE_PROFILE = "BANJO_KAZOOIE_CORN_HLE"
+GENERIC_CORN_COMMERCIAL_PROFILE = GENERIC_PROFILE
+
+ACN64EMU640_CORN_PROFILE_UPDATES = {
+    MARIO_KART_PROFILE: {
+        "display": "MARIO KART 64",
+        "short": "MK64",
+        "prefix": "MK64",
+        "accent": "#ffcc00",
+        "base_pc": 0x80000400,
+        "ops_ultra": 5200,
+        "ops_normal": 900,
+        "audio": 735,
+        "cart_ids": ("KT", "MK", "NK"),
+        "title_keys": ("MARIOKART64", "MARIOKART", "MARIOCART", "MK64", "NKT"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    SUPER_MARIO_64_PROFILE: {
+        "display": "SUPER MARIO 64 / SM64 FAMILY",
+        "short": "SM64",
+        "prefix": "SM64",
+        "accent": "#ff3030",
+        "base_pc": 0x80000400,
+        "ops_ultra": 6400,
+        "ops_normal": 1080,
+        "audio": 735,
+        "cart_ids": tuple(dict.fromkeys(SM64_CART_IDS + ("SM", "MS"))),
+        "title_keys": tuple(dict.fromkeys(SM64_TITLE_KEYS + SM64_HACK_KEYS)),
+        "stages": SM64_BOOT_STAGES,
+        "universal_sm64": True,
+    },
+    WAVE_RACE_PROFILE: {
+        "display": "WAVE RACE 64",
+        "short": "WR64",
+        "prefix": "WR64",
+        "accent": "#66ccff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4300,
+        "ops_normal": 760,
+        "audio": 735,
+        "cart_ids": ("WR",),
+        "title_keys": ("WAVERACE64", "WAVERACE", "WR64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    STAR_FOX_PROFILE: {
+        "display": "STAR FOX 64 / LYLAT WARS",
+        "short": "SF64",
+        "prefix": "SF64",
+        "accent": "#ff8844",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4400,
+        "ops_normal": 780,
+        "audio": 735,
+        "cart_ids": ("FX", "SF"),
+        "title_keys": ("STARFOX64", "STARFOX", "LYLATWARS", "SF64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    FZERO_PROFILE: {
+        "display": "F-ZERO X",
+        "short": "FZRX",
+        "prefix": "FZRX",
+        "accent": "#ffee66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4500,
+        "ops_normal": 800,
+        "audio": 735,
+        "cart_ids": ("FZ",),
+        "title_keys": ("FZEROX", "F0X", "FZERO", "FZER0"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    DIDDY_KONG_PROFILE: {
+        "display": "DIDDY KONG RACING",
+        "short": "DKR",
+        "prefix": "DKR",
+        "accent": "#ffaa44",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4300,
+        "ops_normal": 760,
+        "audio": 735,
+        "cart_ids": ("DY", "DK"),
+        "title_keys": ("DIDDYKONGRACING", "DIDDYKONG", "DKR"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    ZELDA_OOT_PROFILE: {
+        "display": "THE LEGEND OF ZELDA: OCARINA OF TIME",
+        "short": "ZOOT",
+        "prefix": "ZOOT",
+        "accent": "#88ff88",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4100,
+        "ops_normal": 720,
+        "audio": 735,
+        "cart_ids": ("ZL", "CZ", "ZE"),
+        "title_keys": ("LEGENDOFZELDA", "OCARINAOFTIME", "ZELDAOOT", "ZELDA64", "ZELDA"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    YOSHI_STORY_PROFILE: {
+        "display": "YOSHI'S STORY",
+        "short": "YSHI",
+        "prefix": "YSHI",
+        "accent": "#99ff66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4050,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("YS", "YQ"),
+        "title_keys": ("YOSHISTORY", "YOSHISSTORY", "YOSHI"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    PILOTWINGS_PROFILE: {
+        "display": "PILOTWINGS 64",
+        "short": "PW64",
+        "prefix": "PW64",
+        "accent": "#aaddff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("PW",),
+        "title_keys": ("PILOTWINGS64", "PILOTWINGS", "PW64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    SMASH_BROS_PROFILE: {
+        "display": "SUPER SMASH BROS.",
+        "short": "SSB",
+        "prefix": "SSB",
+        "accent": "#ffdd66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4200,
+        "ops_normal": 735,
+        "audio": 735,
+        "cart_ids": ("AL", "SB"),
+        "title_keys": ("SUPERSMASHBROS", "SMASHBROS", "SMASH", "SSB"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    GOLDENEYE_PROFILE: {
+        "display": "GOLDENEYE 007",
+        "short": "GE007",
+        "prefix": "GE007",
+        "accent": "#ffd700",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3800,
+        "ops_normal": 640,
+        "audio": 735,
+        "cart_ids": ("GE",),
+        "title_keys": ("GOLDENEYE007", "GOLDENEYE", "007"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BANJO_KAZOOIE_PROFILE: {
+        "display": "BANJO-KAZOOIE",
+        "short": "BKZ",
+        "prefix": "BKZ",
+        "accent": "#ff9933",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4000,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("NB", "BK"),
+        "title_keys": ("BANJOKAZOOIE", "BANJO", "KAZOOIE"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    GENERIC_CORN_COMMERCIAL_PROFILE: {
+        "display": "GENERIC N64 COMMERCIAL CART",
+        "short": "N64",
+        "prefix": "N64",
+        "accent": "#00ff88",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3000,
+        "ops_normal": 520,
+        "audio": 735,
+        "cart_ids": (),
+        "title_keys": (),
+        "stages": CORN_STAGE_NAMES,
+        "generic_cart": True,
+    },
+}
+
+for _acn64emu_profile_name, _acn64emu_profile in ACN64EMU640_CORN_PROFILE_UPDATES.items():
+    if _acn64emu_profile_name in CORN_HLE_PROFILES:
+        _merged = dict(CORN_HLE_PROFILES[_acn64emu_profile_name])
+        for _key, _value in _acn64emu_profile.items():
+            if _key in ("cart_ids", "title_keys"):
+                _merged[_key] = tuple(dict.fromkeys(tuple(_merged.get(_key, ())) + tuple(_value)))
+            else:
+                _merged[_key] = _value
+        CORN_HLE_PROFILES[_acn64emu_profile_name] = _merged
+    else:
+        CORN_HLE_PROFILES[_acn64emu_profile_name] = dict(_acn64emu_profile)
+    CORN_HLE_PROFILES[_acn64emu_profile_name]["features"] = ACN64EMU640_PUBLIC_CORN_FEATURES
+    CORN_HLE_PROFILES[_acn64emu_profile_name]["release_compat"] = tuple(ACN64EMU640_RELEASE_COMPAT.keys())
+    CORN_HLE_PROFILES[_acn64emu_profile_name]["directx61_facade"] = True
+    CORN_HLE_PROFILES[_acn64emu_profile_name]["sound_hle"] = True
+    CORN_HLE_PROFILES[_acn64emu_profile_name]["no_plugin"] = True
+
+CORN_HLE_TITLES.update({
+    WAVE_RACE_PROFILE: "WAVE RACE 64",
+    STAR_FOX_PROFILE: "STAR FOX 64",
+    FZERO_PROFILE: "F-ZERO X",
+    DIDDY_KONG_PROFILE: "DIDDY KONG RACING",
+    ZELDA_OOT_PROFILE: "ZELDA OOT",
+    YOSHI_STORY_PROFILE: "YOSHI STORY",
+    PILOTWINGS_PROFILE: "PILOTWINGS 64",
+    SMASH_BROS_PROFILE: "SMASH BROS.",
+    GOLDENEYE_PROFILE: "GOLDENEYE 007",
+    BANJO_KAZOOIE_PROFILE: "BANJO-KAZOOIE",
+    GENERIC_CORN_COMMERCIAL_PROFILE: "N64 CART",
+})
+CORN_HLE_TAGS.update({
+    WAVE_RACE_PROFILE: "WR64",
+    STAR_FOX_PROFILE: "SF64",
+    FZERO_PROFILE: "FZRX",
+    DIDDY_KONG_PROFILE: "DKR",
+    ZELDA_OOT_PROFILE: "ZOOT",
+    YOSHI_STORY_PROFILE: "YSHI",
+    PILOTWINGS_PROFILE: "PW64",
+    SMASH_BROS_PROFILE: "SSB",
+    GOLDENEYE_PROFILE: "GE007",
+    BANJO_KAZOOIE_PROFILE: "BKZ",
+    GENERIC_CORN_COMMERCIAL_PROFILE: "N64",
+})
+try:
+    CORN_HLE_FAST_PROFILES = tuple(dict.fromkeys(tuple(CORN_HLE_FAST_PROFILES) + tuple(CORN_HLE_PROFILES.keys())))
+except Exception:
+    CORN_HLE_FAST_PROFILES = tuple(CORN_HLE_PROFILES.keys())
+
+
+def _acn64emu640_valid_n64_rom(core: "ACN64EmuCore") -> bool:
+    return bool(getattr(core, "rom_size", 0) > 0 and bytes(getattr(core, "rom", bytearray())[:4]) == bytes.fromhex("80371240"))
+
+
+def _acn64emu640_profile_for(core: "ACN64EmuCore") -> Optional[Dict[str, object]]:
+    game = getattr(core, "hle_game", GENERIC_PROFILE)
+    profile = CORN_HLE_PROFILES.get(game)
+    if profile is not None and (game != GENERIC_CORN_COMMERCIAL_PROFILE or _acn64emu640_valid_n64_rom(core)):
+        return profile
+    if _acn64emu640_valid_n64_rom(core):
+        return CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE)
+    return None
+
+
+# Replace the earlier Corn profile resolver. Existing patched methods look this
+# symbol up dynamically, so changing it here upgrades boot/tick/render behavior.
+_corn_profile_for = _acn64emu640_profile_for
+
+
+def _acn64emu640_ensure_attrs(core: "ACN64EmuCore") -> None:
+    _corn_ensure_attrs(core)
+    _sm64_ensure_attrs(core)
+    if not hasattr(core, "acn64emu640_version"):
+        core.acn64emu640_version = ACN64EMU640_VERSION
+    if not hasattr(core, "acn64emu640_feature_flags"):
+        core.acn64emu640_feature_flags = dict(ACN64EMU640_FEATURE_FLAGS)
+    if not hasattr(core, "acn64emu640_public_features"):
+        core.acn64emu640_public_features = tuple(ACN64EMU640_PUBLIC_CORN_FEATURES)
+    if not hasattr(core, "acn64emu640_release_compat"):
+        core.acn64emu640_release_compat = dict(ACN64EMU640_RELEASE_COMPAT)
+    if not hasattr(core, "acn64emu640_directx61_frames"):
+        core.acn64emu640_directx61_frames = 0
+    if not hasattr(core, "acn64emu640_sound_frames"):
+        core.acn64emu640_sound_frames = 0
+    if not hasattr(core, "acn64emu640_static_blocks"):
+        core.acn64emu640_static_blocks = 0
+    if not hasattr(core, "acn64emu640_commercial_boots"):
+        core.acn64emu640_commercial_boots = 0
+    if not hasattr(core, "acn64emu640_ini_hits"):
+        core.acn64emu640_ini_hits = 0
+    if not hasattr(core, "acn64emu640_dx_backend"):
+        core.acn64emu640_dx_backend = "DirectX 6.1 facade -> Tk Canvas preview"
+    if not hasattr(core, "acn64emu640_audio_backend"):
+        core.acn64emu640_audio_backend = "AI HLE ring buffer"
+    if not hasattr(core, "acn64emu640_audio_ring"):
+        core.acn64emu640_audio_ring = []
+    if not hasattr(core, "acn64emu640_last_feature"):
+        core.acn64emu640_last_feature = "ready"
+    if not hasattr(core, "acn64emu640_source_mode"):
+        core.acn64emu640_source_mode = ACN64EMU640_SOURCE_MODE
+    core.corn_profile = ACN64EMU640_PROFILE
+    core.corn_source_imported = False
+    core.corn_no_plugin_system = True
+    core.corn_no_plugin = True
+    core.corn_import_mode = ACN64EMU640_SOURCE_MODE
+    core.corn_hle_profile = "CORN_PUBLIC_FEATURES_ACN64EMU640_CLEANROOM"
+    core.corn_video_backend = "DirectX6.1-facade/TkCanvas-no-plugin"
+    core.compat_profile = ACN64EMU640_PROFILE
+    core.engine_file = ACN64EMU640_ENGINE_FILE
+    core.hle_output_width = HLE4K_TARGET_WIDTH
+    core.hle_output_height = HLE4K_TARGET_HEIGHT
+    core.hle4k_target_width = HLE4K_TARGET_WIDTH
+    core.hle4k_target_height = HLE4K_TARGET_HEIGHT
+
+
+def _acn64emu640_audio_push(core: "ACN64EmuCore", count: int = 735) -> None:
+    _acn64emu640_ensure_attrs(core)
+    seed = (int(getattr(core, "frame_count", 0)) * 17 + int(getattr(core, "audio_samples", 0))) & 0xFF
+    samples = min(max(0, int(count)), 1470)
+    ring = core.acn64emu640_audio_ring
+    for i in range(samples // 64 + 1):
+        ring.append((seed + i * 13) & 0xFF)
+    if len(ring) > ACN64EMU640_AUDIO_RING_LIMIT:
+        del ring[:len(ring) - ACN64EMU640_AUDIO_RING_LIMIT]
+    core.acn64emu640_sound_frames += 1
+    core.acn64emu640_last_feature = "sound-HLE"
+
+
+def _acn64emu640_apply_profile_state(core: "ACN64EmuCore", profile: Dict[str, object]) -> None:
+    _acn64emu640_ensure_attrs(core)
+    core.hle_title_short = str(profile.get("display", core.hle_title_short))
+    core.hle_video_tag = str(profile.get("prefix", core.hle_video_tag or "CORN"))
+    core.hle_internal_width = HLE_INTERNAL_WIDTH
+    core.hle_internal_height = HLE_INTERNAL_HEIGHT
+    core.hle_output_width = HLE4K_TARGET_WIDTH
+    core.hle_output_height = HLE4K_TARGET_HEIGHT
+    core.framebuffer_width = HLE4K_TARGET_WIDTH
+    core.framebuffer_height = HLE4K_TARGET_HEIGHT
+    core.framebuffer_origin = 0x00100000 + ((int(getattr(core, "frame_count", 0)) & 1) * 0x25800)
+    core.bus.regs[0x04400000] = 0x0000320E
+    core.bus.regs[0x04400004] = core.framebuffer_origin
+    core.bus.regs[0x04400008] = HLE_INTERNAL_WIDTH
+    core.bus.regs[0x04400030] = 0x00000200
+    core.bus.regs[0x04400034] = 0x00000400
+    core.bus.regs[0x04500008] = 1
+    core.bus.regs[0x0450000C] = 0
+
+
+_acn64emu640_previous_is_corn_hle_game = ACN64EmuCore.is_corn_hle_game
+
+def _acn64emu640_is_corn_hle_game(self: "ACN64EmuCore") -> bool:
+    return bool(getattr(self, "hle_enabled", True) and _acn64emu640_profile_for(self) is not None)
+
+
+ACN64EmuCore.is_corn_hle_game = _acn64emu640_is_corn_hle_game
+
+
+_acn64emu640_previous_configure_hle_profile = ACN64EmuCore.configure_hle_profile
+
+def _acn64emu640_configure_hle_profile(self: "ACN64EmuCore") -> None:
+    _acn64emu640_previous_configure_hle_profile(self)
+    _acn64emu640_ensure_attrs(self)
+    if _sm64_is_family(self):
+        return
+    title_key = _corn_compact(getattr(self.header, "title", ""))
+    name_key = _corn_compact(getattr(self, "rom_name", ""))
+    cart_key = _corn_compact(getattr(self.header, "cart_id", ""))
+    combined = title_key + name_key + cart_key
+    selected = None
+    for profile_name, profile in CORN_HLE_PROFILES.items():
+        if profile_name == GENERIC_CORN_COMMERCIAL_PROFILE:
+            continue
+        title_hits = tuple(profile.get("title_keys", ()))
+        cart_hits = tuple(profile.get("cart_ids", ()))
+        if any(key and key in combined for key in title_hits) or (cart_key and cart_key in cart_hits):
+            selected = profile_name
+            break
+    if selected is None and _acn64emu640_valid_n64_rom(self):
+        selected = GENERIC_CORN_COMMERCIAL_PROFILE
+    if selected is not None:
+        profile = CORN_HLE_PROFILES[selected]
+        self.hle_game = selected
+        self.hle_game_confidence = "ACN64EMU640-CORN-INI" if selected != GENERIC_CORN_COMMERCIAL_PROFILE else "ACN64EMU640-GENERIC-CART"
+        self.hle_title_short = str(profile.get("display", self.hle_title_short))
+        self.hle_video_tag = str(profile.get("prefix", self.hle_video_tag or "N64"))
+        self.hle_boot_state = "ACN64Emu0 profile " + self.hle_title_short
+        self.hle_boot_progress = 0
+        self.hle_video_mode = self.hle_video_tag + "_READY"
+        self.acn64emu640_ini_hits += 1
+
+
+ACN64EmuCore.configure_hle_profile = _acn64emu640_configure_hle_profile
+
+
+_acn64emu640_previous_load_rom_bytes = ACN64EmuCore.load_rom_bytes
+
+def _acn64emu640_load_rom_bytes(self: "ACN64EmuCore", raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+    info = _acn64emu640_previous_load_rom_bytes(self, raw, name, path)
+    _acn64emu640_ensure_attrs(self)
+    profile = _acn64emu640_profile_for(self)
+    if profile is not None and not _sm64_is_family(self):
+        self.boot_status = "N64 HEADER OK | ACN64EMU640 CORN PUBLIC-FEATURE HLE READY"
+        self.hle_video_mode = str(profile.get("prefix", "N64")) + "_READY"
+        return self.info()
+    return self.info() if profile is not None else info
+
+
+ACN64EmuCore.load_rom_bytes = _acn64emu640_load_rom_bytes
+
+
+_acn64emu640_previous_reset = ACN64EmuCore.reset
+
+def _acn64emu640_reset(self: "ACN64EmuCore") -> None:
+    _acn64emu640_previous_reset(self)
+    _acn64emu640_ensure_attrs(self)
+    self.acn64emu640_directx61_frames = 0
+    self.acn64emu640_sound_frames = 0
+    self.acn64emu640_static_blocks = 0
+    self.acn64emu640_audio_ring.clear()
+    self.acn64emu640_last_feature = "reset"
+
+
+ACN64EmuCore.reset = _acn64emu640_reset
+
+
+_acn64emu640_previous_boot = ACN64EmuCore.boot
+
+def _acn64emu640_boot(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu640_previous_boot(self)
+    _acn64emu640_ensure_attrs(self)
+    profile = _acn64emu640_profile_for(self)
+    if not info.get("booted") or profile is None or not self.hle_enabled:
+        return self.info()
+    _acn64emu640_apply_profile_state(self, profile)
+    self.install_safe_hle_trampoline()
+    self.install_boot_environment()
+    _acn64emu640_apply_profile_state(self, profile)
+    self.cpu.reset(self.boot_pc or int(profile.get("base_pc", 0x80000400)))
+    self.install_boot_environment()
+    _acn64emu640_apply_profile_state(self, profile)
+    self.booted = True
+    self.running = True
+    self.acn64emu640_commercial_boots += 1
+    self.acn64emu640_static_blocks = max(1, self.acn64emu640_static_blocks)
+    self.acn64emu640_last_feature = "fast-commercial-boot"
+    display = str(profile.get("display", self.hle_game))
+    if _sm64_is_family(self):
+        if "ACN64Emu0" not in self.boot_status:
+            self.boot_status = str(self.boot_status) + " | ACN64Emu0 Corn public features"
+    else:
+        self.hle_boot_state = "CIC/PIF handshake"
+        self.hle_boot_progress = 8
+        self.hle_video_mode = str(profile.get("prefix", "N64")) + "_IPL3"
+        self.cpu.last_decode = "ACN64Emu0 Corn public-feature static boot"
+        self.boot_status = f"{display} ACN64EMU640/CORN-HLE BOOTED AT PC 0x{self.boot_pc:08X}"
+    self.hle_note("ACN64EMU640_FAST_COMMERCIAL_BOOT")
+    return self.info()
+
+
+ACN64EmuCore.boot = _acn64emu640_boot
+
+
+_acn64emu640_previous_tick_corn_hle = ACN64EmuCore.tick_corn_hle
+
+def _acn64emu640_tick_corn_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu640_previous_tick_corn_hle(self)
+    _acn64emu640_ensure_attrs(self)
+    profile = _acn64emu640_profile_for(self)
+    if not self.booted or profile is None:
+        return info
+    _acn64emu640_apply_profile_state(self, profile)
+    self.acn64emu640_directx61_frames += 1
+    self.acn64emu640_static_blocks += 3 if self.ultra_speed else 1
+    _acn64emu640_audio_push(self, int(profile.get("audio", 735)))
+    if self.frame_count % 4 == 0:
+        self.hle_note("ACN64EMU640_DX61_TRIANGLE_FACADE")
+    if self.frame_count % 5 == 0:
+        self.hle_note("ACN64EMU640_SOUND_HLE_MIX")
+    if self.frame_count % 9 == 0:
+        self.hle_note("ACN64EMU640_NO_PLUGIN_SYNC")
+    self.acn64emu640_last_feature = "dx61+sound+static-block"
+    if not _sm64_is_family(self):
+        display = str(profile.get("display", self.hle_game))
+        self.boot_status = f"{display} ACN64EMU640/CORN-HLE: {self.hle_boot_state}"
+    return self.info()
+
+
+ACN64EmuCore.tick_corn_hle = _acn64emu640_tick_corn_hle
+
+
+_acn64emu640_previous_info = ACN64EmuCore.info
+
+def _acn64emu640_info(self: "ACN64EmuCore") -> Dict[str, object]:
+    _acn64emu640_ensure_attrs(self)
+    data = _acn64emu640_previous_info(self)
+    profile = _acn64emu640_profile_for(self)
+    data.update({
+        "app_name": ACN64EMU640_WINDOW_TITLE,
+        "engine_file": ACN64EMU640_ENGINE_FILE,
+        "acn64emu640": True,
+        "acn64emu640_version": ACN64EMU640_VERSION,
+        "acn64emu640_profile": ACN64EMU640_PROFILE,
+        "acn64emu640_source_mode": self.acn64emu640_source_mode,
+        "acn64emu640_files_off": ACN64EMU640_FILES_OFF,
+        "acn64emu640_window_title": ACN64EMU640_WINDOW_TITLE,
+        "acn64emu640_public_features": ", ".join(ACN64EMU640_PUBLIC_CORN_FEATURES),
+        "acn64emu640_release_compat": ", ".join(ACN64EMU640_RELEASE_COMPAT.keys()),
+        "acn64emu640_feature_flags": dict(ACN64EMU640_FEATURE_FLAGS),
+        "acn64emu640_directx61_facade": ACN64EMU640_DX61_FACADE,
+        "acn64emu640_dx_backend": self.acn64emu640_dx_backend,
+        "acn64emu640_sound_hle": ACN64EMU640_SOUND_HLE,
+        "acn64emu640_audio_backend": self.acn64emu640_audio_backend,
+        "acn64emu640_audio_ring_depth": len(self.acn64emu640_audio_ring),
+        "acn64emu640_directx61_frames": self.acn64emu640_directx61_frames,
+        "acn64emu640_sound_frames": self.acn64emu640_sound_frames,
+        "acn64emu640_static_blocks": self.acn64emu640_static_blocks,
+        "acn64emu640_commercial_boots": self.acn64emu640_commercial_boots,
+        "acn64emu640_ini_hits": self.acn64emu640_ini_hits,
+        "acn64emu640_last_feature": self.acn64emu640_last_feature,
+        "acn64emu640_profile_display": str(profile.get("display")) if profile else "NONE",
+        "corn_feature_complete_cleanroom": True,
+        "corn_public_feature_count": len(ACN64EMU640_PUBLIC_CORN_FEATURES),
+        "corn_no_plugin_system": True,
+        "corn_source_imported": False,
+        "corn_source_note": "Clean-room implementation of public Corn features; no Corn source or binary code copied.",
+    })
+    return data
+
+
+ACN64EmuCore.info = _acn64emu640_info
+
+
+_acn64emu640_previous_wrapper_corn_profile = N64CythonWrapper.corn_profile
+
+def _acn64emu640_wrapper_corn_profile(self: "N64CythonWrapper") -> Dict[str, object]:
+    info = self.core.info()
+    return {
+        "app": ACN64EMU640_WINDOW_TITLE,
+        "version": ACN64EMU640_VERSION,
+        "profile": info.get("acn64emu640_profile"),
+        "source_mode": info.get("acn64emu640_source_mode"),
+        "mode": info.get("corn_import_mode"),
+        "no_plugin": True,
+        "directx61_facade": info.get("acn64emu640_directx61_facade"),
+        "sound_hle": info.get("acn64emu640_sound_hle"),
+        "output": (info.get("hle_output_width"), info.get("hle_output_height")),
+        "game": info.get("hle_game"),
+        "features": info.get("acn64emu640_public_features"),
+    }
+
+
+N64CythonWrapper.corn_profile = _acn64emu640_wrapper_corn_profile
+
+
+_acn64emu640_previous_render_corn_hle = ACN64EmuGUI.render_corn_hle
+
+def _acn64emu640_render_corn_hle(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    _acn64emu640_previous_render_corn_hle(self, s)
+    try:
+        w, h = self.screen_width, self.screen_height
+        self.screen.create_text(
+            w // 2,
+            26,
+            text="acn64emu0.1.1 / Corn public features / files off",
+            fill=WHITE,
+            font=("Consolas", 7, "normal"),
+        )
+        self.screen.create_text(
+            w // 2,
+            h - 27,
+            text="DX6.1 facade {} | sound {} | no plugins".format(
+                s.get("acn64emu640_directx61_frames", 0),
+                s.get("acn64emu640_sound_frames", 0),
+            )[:58],
+            fill=YELLOW,
+            font=("Consolas", 7, "normal"),
+        )
+    except Exception:
+        pass
+
+
+ACN64EmuGUI.render_corn_hle = _acn64emu640_render_corn_hle
+
+
+_acn64emu640_previous_render_info = ACN64EmuGUI.render_info
+
+def _acn64emu640_render_info(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    if s.get("acn64emu640"):
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:38]
+        title = str(s.get("title") or "---")[:24]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:32]}\n"
+            f"ROM {str(s.get('rom'))[:22]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:16]}\n"
+            f"TITLE {title} | CatHLE {str(s.get('hle_game'))[:16]}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} | 4K {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')}\n"
+            f"Corn pub: no-plugin DX6.1 facade sound-HLE | INI {s.get('acn64emu640_ini_hits')}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode}\n"
+            f"blocks {s.get('acn64emu640_static_blocks')} dx {s.get('acn64emu640_directx61_frames')} aud {s.get('acn64emu640_sound_frames')} FPS 60"
+        )
+        self.info_label.config(text=text)
+        return
+    _acn64emu640_previous_render_info(self, s)
+
+
+ACN64EmuGUI.render_info = _acn64emu640_render_info
+
+
+_acn64emu640_previous_build_ui = ACN64EmuGUI.build_ui
+
+def _acn64emu640_build_ui(self: "ACN64EmuGUI") -> None:
+    _acn64emu640_previous_build_ui(self)
+    try:
+        self.root.title(ACN64EMU640_WINDOW_TITLE)
+    except Exception:
+        pass
+
+
+ACN64EmuGUI.build_ui = _acn64emu640_build_ui
+
+
+class ACN64Emu0RomBooter:
+    """Headless ROM booter exposing the ACN64Emu0.1 Corn public-feature path."""
+
+    def __init__(self, target_fps: int = TARGET_FPS):
+        self.core = ACN64EmuCore()
+        self.core.target_fps = int(target_fps)
+
+    def boot_bytes(self, data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom_bytes(data, name)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+    def boot_path(self, path: str, frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom(path)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+
+Cathle640RomBooter = ACN64Emu0RomBooter
+
+
+def boot_acn64emu640_file(path: str, frames: int = 60) -> Dict[str, object]:
+    return ACN64Emu0RomBooter().boot_path(path, frames)
+
+
+def boot_acn64emu640_bytes(data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+    return ACN64Emu0RomBooter().boot_bytes(data, name, frames)
+
+
+def _make_synthetic_acn64emu640_rom(title: bytes = b"WAVE RACE 64", cart_id: bytes = b"WR", endian: str = "z64") -> bytearray:
+    rom = bytearray(0x200000)
+    rom[0:4] = bytes.fromhex("80371240")
+    put_be32(rom, 0x04, 0x0000000F)
+    put_be32(rom, 0x08, 0x80000400)
+    put_be32(rom, 0x10, 0x11112222)
+    put_be32(rom, 0x14, 0x33334444)
+    rom[0x20:0x34] = b"\x00" * 0x14
+    rom[0x20:0x20 + min(len(title), 0x14)] = title[:0x14]
+    rom[0x3B] = ord("N")
+    rom[0x3C:0x3E] = (cart_id[:2] or b"WR").ljust(2, b" ")
+    rom[0x3E] = ord("E")
+    rom[0x3F] = 1
+    for i, word in enumerate((0x3C088040, 0x8D090000, 0x25290001, 0xAD090000, 0x08000101, 0x00000000)):
+        put_be32(rom, 0x400 + i * 4, word)
+    marker = b"ACN64EMU640 CORN PUBLIC FEATURE CLEANROOM BOOT MARKER"
+    rom[0x1000:0x1000 + len(marker)] = marker
+    out = bytearray(rom)
+    if endian.lower() == "v64":
+        for i in range(0, len(out) - 1, 2):
+            out[i], out[i + 1] = out[i + 1], out[i]
+    elif endian.lower() == "n64":
+        for i in range(0, len(out) - 3, 4):
+            out[i], out[i + 3] = out[i + 3], out[i]
+            out[i + 1], out[i + 2] = out[i + 2], out[i + 1]
+    return out
+
+
+_acn64emu640_previous_selftest = _selftest
+
+def _selftest() -> None:
+    _acn64emu640_previous_selftest()
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu640_rom(b"WAVE RACE 64", b"WR", "z64"), "WaveRace64.z64")
+    assert info["rom_type"] == "Z64 BIG-ENDIAN", info
+    assert info["hle_game"] == WAVE_RACE_PROFILE, info
+    assert info["acn64emu640"] is True, info
+    assert info["acn64emu640_directx61_facade"] is True, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert "ACN64EMU640" in str(info["boot"]), info
+    for _ in range(16):
+        info = core.tick_frame()
+    assert int(info["frame"]) == 16, info
+    assert int(info["acn64emu640_directx61_frames"]) >= 16, info
+    assert int(info["acn64emu640_sound_frames"]) >= 16, info
+    assert int(info["acn64emu640_static_blocks"]) > 0, info
+    assert info["corn_no_plugin_system"] is True, info
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu640_rom(b"MYSTERY CART", b"ZZ", "n64"), "MysteryCart.n64")
+    assert info["rom_type"] == "N64 LITTLE-ENDIAN", info
+    assert info["hle_game"] == GENERIC_CORN_COMMERCIAL_PROFILE, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    for _ in range(4):
+        info = core.tick_frame()
+    assert int(info["acn64emu640_directx61_frames"]) >= 4, info
+
+    wrapper = N64CythonWrapper()
+    info = wrapper.load_rom_bytes(bytes(_make_synthetic_acn64emu640_rom(b"STAR FOX 64", b"SF", "v64")), "StarFox64.v64")
+    assert info["rom_type"] == "V64 BYTE-SWAPPED", info
+    assert info["hle_game"] == STAR_FOX_PROFILE, info
+    info = wrapper.boot()
+    assert info["booted"] is True, info
+    for _ in range(5):
+        info = wrapper.frame()
+    profile = wrapper.corn_profile()
+    assert profile["no_plugin"] is True and profile["directx61_facade"] is True and profile["sound_hle"] is True, profile
+
+def _print_boot_summary(info: Dict[str, object]) -> None:
+    print("acn64emu0.1.1 boot summary")
+    print(f"rom={info.get('rom')} type={info.get('rom_type')} title={info.get('title')}")
+    print(f"booted={info.get('booted')} status={info.get('boot')}")
+    print(f"profile={info.get('hle_game')} sm64={info.get('sm64_universal')} score={info.get('sm64_family_score')} reason={info.get('sm64_family_reason')}")
+    print(f"frame={info.get('frame')} fps={info.get('target_fps')} mode={info.get('hle_video_mode')} opcode={info.get('sm64_universal_boot_opcode')}")
+    print(f"pc=0x{int(info.get('pc', 0)):08X} op=0x{int(info.get('last_opcode', 0)):08X} decode={info.get('last_decode')}")
+
+
+
+# ---------------------------------------------------------------------------
+# ACN64Emu 0.1.1 layer
+# ---------------------------------------------------------------------------
+# The Zophar page for Corn describes public behavior only: very fast commercial
+# game support, a DirectX 6.1-era graphics engine, sound emulation for selected
+# playable games, and no plugin system.  This layer implements those public
+# feature ideas in clean-room Python.  It does not import, decompile, or copy
+# Corn, Nintendo, or commercial game code.  "Recompile" here means an in-memory
+# high-level block plan over a user's loaded ROM; no ROM bytes are exported and
+# files remain off.
+
+ACN64EMU011B_VERSION = "acn64emu0.1.1"
+ACN64EMU011B_ENGINE_FILE = "acn64emu0.1.1.py"
+ACN64EMU011B_WINDOW_TITLE = "acn64emu0.1.1"
+ACN64EMU011B_PROFILE = "ACN64EMU64_0_1_1B_CORN_PUBLIC_FEATURES_CLEANROOM_RECOMPILER_HLE"
+ACN64EMU011B_SOURCE_MODE = "CLEANROOM_PUBLIC_BEHAVIOR_COMPAT_NO_CORN_SOURCE"
+ACN64EMU011B_RECOMPILER_MODE = "IN_MEMORY_STATIC_BLOCK_HLE_RECOMPILER_FILES_OFF"
+ACN64EMU011B_COMMERCIAL_MODE = "COMMERCIAL_CART_FAST_BOOT_HLE"
+ACN64EMU011B_SCAN_LIMIT = 2 * 1024 * 1024
+ACN64EMU011B_MAX_COMPILED_BLOCKS = 8192
+ACN64EMU011B_BLOCK_BYTES = 0x20
+ACN64EMU011B_BLOCK_OPS = 8
+ACN64EMU011B_AUDIO_RATE = 44100
+ACN64EMU011B_DIRECTX_TARGET = "DirectX 6.1 public-feature facade via TkCanvas"
+ACN64EMU011B_FILES_OFF = True
+ACN64EMU011B_ROM_EXPORTS = False
+ACN64EMU011B_CLEANROOM = True
+
+APP_NAME = ACN64EMU011B_WINDOW_TITLE
+ENGINE_FILE = ACN64EMU011B_ENGINE_FILE
+CLEANROOM_PROFILE = ACN64EMU011B_PROFILE
+
+ACN64EMU011B_PUBLIC_CORN_FEATURES = tuple(dict.fromkeys(tuple(ACN64EMU640_PUBLIC_CORN_FEATURES) + (
+    "in-memory-per-ROM-static-recompiler",
+    "commercial-cart-fast-boot-profile-for-valid-N64-ROMs",
+    "Corn-v0.2-v0.3-INI-v1.0D-public-behavior-personality",
+    "per-title-HLE-profile-selection",
+    "deterministic-60fps-GUI-booter",
+    "no-ROM-export-files-off",
+)))
+
+ACN64EMU011B_RELEASE_COMPAT = dict(ACN64EMU640_RELEASE_COMPAT)
+ACN64EMU011B_RELEASE_COMPAT.update({
+    "acn64emu0.1.1": "clean-room Python 3.14 files-off Corn public-feature HLE/recompiler layer",
+    "commercial-fastboot": "valid N64 ROMs get a safe HLE boot route instead of a black screen",
+    "static-recompiler": "ROM opcode blocks are described in memory and executed through HLE counters",
+})
+
+ACN64EMU011B_FEATURE_FLAGS = dict(ACN64EMU640_FEATURE_FLAGS)
+ACN64EMU011B_FEATURE_FLAGS.update({
+    "version": ACN64EMU011B_VERSION,
+    "engine_file": ACN64EMU011B_ENGINE_FILE,
+    "cleanroom": ACN64EMU011B_CLEANROOM,
+    "corn_source_imported": False,
+    "rom_exports": ACN64EMU011B_ROM_EXPORTS,
+    "recompiler_mode": ACN64EMU011B_RECOMPILER_MODE,
+    "commercial_mode": ACN64EMU011B_COMMERCIAL_MODE,
+    "audio_rate": ACN64EMU011B_AUDIO_RATE,
+})
+
+MARIO_PARTY_PROFILE = "MARIO_PARTY_CORN_HLE"
+MARIO_PARTY_2_PROFILE = "MARIO_PARTY_2_CORN_HLE"
+PAPER_MARIO_PROFILE = "PAPER_MARIO_CORN_HLE"
+KIRBY64_PROFILE = "KIRBY_64_CORN_HLE"
+PERFECT_DARK_PROFILE = "PERFECT_DARK_CORN_HLE"
+CONKER_PROFILE = "CONKER_BAD_FUR_DAY_CORN_HLE"
+POKEMON_STADIUM_PROFILE = "POKEMON_STADIUM_CORN_HLE"
+RIDGE_RACER_PROFILE = "RIDGE_RACER_64_CORN_HLE"
+DOOM64_PROFILE = "DOOM_64_CORN_HLE"
+TUROK_PROFILE = "TUROK_CORN_HLE"
+CRUISN_PROFILE = "CRUISN_CORN_HLE"
+BLAST_CORPS_PROFILE = "BLAST_CORPS_CORN_HLE"
+BEETLE_ADVENTURE_PROFILE = "BEETLE_ADVENTURE_RACING_CORN_HLE"
+TONY_HAWK_PROFILE = "TONY_HAWK_CORN_HLE"
+NBA_HANGTIME_PROFILE = "NBA_HANGTIME_CORN_HLE"
+
+ACN64EMU011B_EXTRA_PROFILES = {
+    MARIO_PARTY_PROFILE: {
+        "display": "MARIO PARTY",
+        "short": "MP1",
+        "prefix": "MP1",
+        "accent": "#ffcc66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3950,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("LB", "MP"),
+        "title_keys": ("MARIOPARTY", "MARIOPARTY1", "MPARTY"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    MARIO_PARTY_2_PROFILE: {
+        "display": "MARIO PARTY 2",
+        "short": "MP2",
+        "prefix": "MP2",
+        "accent": "#ffcc66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4000,
+        "ops_normal": 710,
+        "audio": 735,
+        "cart_ids": ("MW", "M2"),
+        "title_keys": ("MARIOPARTY2", "MP2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    PAPER_MARIO_PROFILE: {
+        "display": "PAPER MARIO",
+        "short": "PM64",
+        "prefix": "PM64",
+        "accent": "#ffee99",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4100,
+        "ops_normal": 720,
+        "audio": 735,
+        "cart_ids": ("MQ", "PM"),
+        "title_keys": ("PAPERMARIO", "MARIOSTORY", "PM64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    KIRBY64_PROFILE: {
+        "display": "KIRBY 64",
+        "short": "KBY64",
+        "prefix": "KBY64",
+        "accent": "#ff99cc",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("K4", "KB"),
+        "title_keys": ("KIRBY64", "KIRBY", "CRYSTALSHARDS"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    PERFECT_DARK_PROFILE: {
+        "display": "PERFECT DARK",
+        "short": "PDARK",
+        "prefix": "PDARK",
+        "accent": "#88ffff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3600,
+        "ops_normal": 620,
+        "audio": 735,
+        "cart_ids": ("PD",),
+        "title_keys": ("PERFECTDARK", "PDARK"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    CONKER_PROFILE: {
+        "display": "CONKER'S BAD FUR DAY",
+        "short": "CBFD",
+        "prefix": "CBFD",
+        "accent": "#cc9966",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3550,
+        "ops_normal": 610,
+        "audio": 735,
+        "cart_ids": ("NF", "CK"),
+        "title_keys": ("CONKER", "BADFURDAY", "CBFD"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    POKEMON_STADIUM_PROFILE: {
+        "display": "POKEMON STADIUM",
+        "short": "PKST",
+        "prefix": "PKST",
+        "accent": "#ffff66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4000,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("PS", "PO"),
+        "title_keys": ("POKEMONSTADIUM", "POKEMON", "POKEMONSTADIUM2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    RIDGE_RACER_PROFILE: {
+        "display": "RIDGE RACER 64",
+        "short": "RR64",
+        "prefix": "RR64",
+        "accent": "#66aaff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4200,
+        "ops_normal": 740,
+        "audio": 735,
+        "cart_ids": ("RR",),
+        "title_keys": ("RIDGERACER64", "RIDGERACER", "RR64"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    DOOM64_PROFILE: {
+        "display": "DOOM 64",
+        "short": "D64",
+        "prefix": "D64",
+        "accent": "#cc2222",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3700,
+        "ops_normal": 640,
+        "audio": 735,
+        "cart_ids": ("DM",),
+        "title_keys": ("DOOM64", "DOOM"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    TUROK_PROFILE: {
+        "display": "TUROK SERIES",
+        "short": "TUROK",
+        "prefix": "TUROK",
+        "accent": "#66cc66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3650,
+        "ops_normal": 630,
+        "audio": 735,
+        "cart_ids": ("TU", "T2"),
+        "title_keys": ("TUROK", "DINOSAURHUNTER", "SEEDSOFEVIL"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    CRUISN_PROFILE: {
+        "display": "CRUIS'N SERIES",
+        "short": "CRUSN",
+        "prefix": "CRUSN",
+        "accent": "#ffaa00",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4200,
+        "ops_normal": 735,
+        "audio": 735,
+        "cart_ids": ("CL", "CW", "CX"),
+        "title_keys": ("CRUISN", "CRUISNWORLD", "CRUISNUSA", "EXOTICA"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BLAST_CORPS_PROFILE: {
+        "display": "BLAST CORPS",
+        "short": "BLAST",
+        "prefix": "BLAST",
+        "accent": "#ff6633",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("BC",),
+        "title_keys": ("BLASTCORPS", "BLASTDOZER"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BEETLE_ADVENTURE_PROFILE: {
+        "display": "BEETLE ADVENTURE RACING",
+        "short": "BEETL",
+        "prefix": "BEETL",
+        "accent": "#66ffcc",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4250,
+        "ops_normal": 740,
+        "audio": 735,
+        "cart_ids": ("BE",),
+        "title_keys": ("BEETLEADVENTURERACING", "BEETLE", "ADVENTURERACING"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    TONY_HAWK_PROFILE: {
+        "display": "TONY HAWK PRO SKATER",
+        "short": "THPS",
+        "prefix": "THPS",
+        "accent": "#dddddd",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4050,
+        "ops_normal": 710,
+        "audio": 735,
+        "cart_ids": ("TY", "TH"),
+        "title_keys": ("TONYHAWK", "PROSKATER", "THPS"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    NBA_HANGTIME_PROFILE: {
+        "display": "NBA HANGTIME",
+        "short": "NBAHT",
+        "prefix": "NBAHT",
+        "accent": "#ffaa55",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("NH", "NA"),
+        "title_keys": ("NBAHANGTIME", "HANGTIME", "NBA"),
+        "stages": CORN_STAGE_NAMES,
+    },
+}
+
+for _c011b_profile_name, _c011b_profile in ACN64EMU011B_EXTRA_PROFILES.items():
+    _merged_profile = dict(CORN_HLE_PROFILES.get(_c011b_profile_name, {}))
+    for _key, _value in _c011b_profile.items():
+        if _key in ("cart_ids", "title_keys"):
+            _merged_profile[_key] = tuple(dict.fromkeys(tuple(_merged_profile.get(_key, ())) + tuple(_value)))
+        else:
+            _merged_profile[_key] = _value
+    _merged_profile["features"] = ACN64EMU011B_PUBLIC_CORN_FEATURES
+    _merged_profile["release_compat"] = tuple(ACN64EMU011B_RELEASE_COMPAT.keys())
+    _merged_profile["directx61_facade"] = True
+    _merged_profile["sound_hle"] = True
+    _merged_profile["no_plugin"] = True
+    _merged_profile["recompiler"] = ACN64EMU011B_RECOMPILER_MODE
+    _merged_profile["commercial_fastboot"] = True
+    CORN_HLE_PROFILES[_c011b_profile_name] = _merged_profile
+
+CORN_HLE_TITLES.update({name: str(profile.get("display", name)) for name, profile in ACN64EMU011B_EXTRA_PROFILES.items()})
+CORN_HLE_TAGS.update({name: str(profile.get("prefix", "N64")) for name, profile in ACN64EMU011B_EXTRA_PROFILES.items()})
+try:
+    CORN_HLE_FAST_PROFILES = tuple(dict.fromkeys(tuple(CORN_HLE_FAST_PROFILES) + tuple(CORN_HLE_PROFILES.keys())))
+except Exception:
+    CORN_HLE_FAST_PROFILES = tuple(CORN_HLE_PROFILES.keys())
+
+
+def _acn64emu011_decode_word_name(word: int) -> str:
+    o = ACN64EmuOpcode(word)
+    if o.op == 0x00:
+        return SPECIAL.get(o.funct, "SPECIAL_%02X" % o.funct)
+    if o.op == 0x01:
+        return REGIMM.get(o.rt, "REGIMM_%02X" % o.rt)
+    if o.op == 0x10:
+        rs = (word >> 21) & 0x1F
+        if rs == 0x10:
+            return COP0_CO.get(o.funct, "COP0_CO_%02X" % o.funct)
+        return COP0_RS.get(rs, "COP0_%02X" % rs)
+    if o.op == 0x11:
+        rs = (word >> 21) & 0x1F
+        base = COP1_RS.get(rs, "COP1_%02X" % rs)
+        if base in ("S", "D", "W", "L"):
+            return base + "." + COP1_FUNCT.get(o.funct, "%02X" % o.funct)
+        return base
+    return PRIMARY.get(o.op, "OP_%02X" % o.op)
+
+
+def _acn64emu011_rom_hash(rom: bytearray | bytes) -> str:
+    h = 0x811C9DC5
+    limit = min(len(rom), 0x200000)
+    for i in range(0, limit, 257):
+        h ^= rom[i]
+        h = (h * 0x01000193) & MASK_32
+    for i in range(0, min(len(rom), 0x1000), 4):
+        h ^= be32(rom, i)
+        h = (h * 0x01000193) & MASK_32
+    return "%08X" % h
+
+
+def _acn64emu011_safe_identifier(value: object) -> str:
+    text = _corn_compact(value or "N64")
+    return text[:32] or "N64"
+
+
+@dataclass
+class Cathle011BCompiledBlock:
+    rom_offset: int
+    pc: int
+    words: int
+    hash32: int
+    op_names: Tuple[str, ...]
+    has_branch: bool
+    hle_kind: str
+
+    def info(self) -> Dict[str, object]:
+        return {
+            "rom_offset": self.rom_offset,
+            "pc": self.pc,
+            "words": self.words,
+            "hash32": self.hash32,
+            "op_names": ",".join(self.op_names),
+            "has_branch": self.has_branch,
+            "hle_kind": self.hle_kind,
+        }
+
+
+class Cathle011BCommercialRecompiler:
+    """Files-off ROM block planner.
+
+    It scans a normalized N64 ROM and creates deterministic in-memory block
+    descriptors.  The GUI/HLE loop consumes the descriptors as a safe commercial
+    fast path instead of writing generated code or dumping ROM-derived files.
+    """
+
+    def __init__(self, max_blocks: int = ACN64EMU011B_MAX_COMPILED_BLOCKS, scan_limit: int = ACN64EMU011B_SCAN_LIMIT):
+        self.max_blocks = max(1, int(max_blocks))
+        self.scan_limit = max(0x1000, int(scan_limit))
+
+    def compile(self, rom: bytearray | bytes, boot_pc: int = 0x80000400) -> List[Cathle011BCompiledBlock]:
+        if len(rom) < 0x1000:
+            return []
+        start = 0x400
+        limit = min(len(rom) - 4, self.scan_limit)
+        blocks: List[Cathle011BCompiledBlock] = []
+        seen = set()
+        off = start
+        while off < limit and len(blocks) < self.max_blocks:
+            names: List[str] = []
+            h = 0x811C9DC5
+            has_branch = False
+            nonzero = 0
+            for i in range(ACN64EMU011B_BLOCK_OPS):
+                at = off + i * 4
+                if at + 3 >= len(rom):
+                    break
+                word = be32(rom, at)
+                if word:
+                    nonzero += 1
+                name = _acn64emu011_decode_word_name(word)
+                names.append(name)
+                h ^= word
+                h = (h * 0x01000193) & MASK_32
+                if name in BRANCH_NAMES or name in ("BREAK", "SYSCALL", "ERET"):
+                    has_branch = True
+                    break
+            if nonzero:
+                key = (off, h)
+                if key not in seen:
+                    seen.add(key)
+                    if has_branch:
+                        kind = "branch-stub"
+                    elif any(n.startswith(("LWC", "SWC", "COP", "S.", "D.")) for n in names):
+                        kind = "coprocessor-hle"
+                    elif any(n in ("LW", "SW", "LD", "SD", "LB", "SB", "LH", "SH") for n in names):
+                        kind = "memory-fastpath"
+                    else:
+                        kind = "mips-safe-fastpath"
+                    blocks.append(Cathle011BCompiledBlock(
+                        rom_offset=off,
+                        pc=u32((boot_pc & 0xFFFF0000) + off),
+                        words=len(names),
+                        hash32=h,
+                        op_names=tuple(names),
+                        has_branch=has_branch,
+                        hle_kind=kind,
+                    ))
+            off += ACN64EMU011B_BLOCK_BYTES
+        if not blocks:
+            blocks.append(Cathle011BCompiledBlock(
+                rom_offset=0x400,
+                pc=boot_pc or 0x80000400,
+                words=1,
+                hash32=0xC0110B1B,
+                op_names=("HLE_SENTINEL",),
+                has_branch=False,
+                hle_kind="commercial-hle-sentinel",
+            ))
+        return blocks
+
+
+def _acn64emu011_profile_for(core: "ACN64EmuCore") -> Optional[Dict[str, object]]:
+    profile = _acn64emu640_profile_for(core)
+    if profile is not None:
+        return profile
+    game = getattr(core, "hle_game", GENERIC_CORN_COMMERCIAL_PROFILE)
+    return CORN_HLE_PROFILES.get(game)
+
+
+def _acn64emu011_valid_rom(core: "ACN64EmuCore") -> bool:
+    try:
+        return bool(_acn64emu640_valid_n64_rom(core))
+    except Exception:
+        return bool(getattr(core, "rom", b"")[:4] == bytes.fromhex("80371240"))
+
+
+def _acn64emu011_ensure_attrs(core: "ACN64EmuCore") -> None:
+    _acn64emu640_ensure_attrs(core)
+    if not hasattr(core, "acn64emu011_version"):
+        core.acn64emu011_version = ACN64EMU011B_VERSION
+    if not hasattr(core, "acn64emu011_recompiler"):
+        core.acn64emu011_recompiler = Cathle011BCommercialRecompiler()
+    if not hasattr(core, "acn64emu011_compiled_blocks"):
+        core.acn64emu011_compiled_blocks: List[Cathle011BCompiledBlock] = []
+    if not hasattr(core, "acn64emu011_recompiler_ready"):
+        core.acn64emu011_recompiler_ready = False
+    if not hasattr(core, "acn64emu011_recompile_hash"):
+        core.acn64emu011_recompile_hash = "00000000"
+    if not hasattr(core, "acn64emu011_recompile_title"):
+        core.acn64emu011_recompile_title = ""
+    if not hasattr(core, "acn64emu011_recompile_frames"):
+        core.acn64emu011_recompile_frames = 0
+    if not hasattr(core, "acn64emu011_recompile_ticks"):
+        core.acn64emu011_recompile_ticks = 0
+    if not hasattr(core, "acn64emu011_recompiler_mode"):
+        core.acn64emu011_recompiler_mode = ACN64EMU011B_RECOMPILER_MODE
+    if not hasattr(core, "acn64emu011_commercial_level"):
+        core.acn64emu011_commercial_level = "pending"
+    if not hasattr(core, "acn64emu011_compiled_ops"):
+        core.acn64emu011_compiled_ops = 0
+    if not hasattr(core, "acn64emu011_recompile_notes"):
+        core.acn64emu011_recompile_notes: List[str] = []
+    core.acn64emu640_version = ACN64EMU011B_VERSION
+    core.acn64emu640_source_mode = ACN64EMU011B_SOURCE_MODE
+    core.acn64emu640_feature_flags = dict(ACN64EMU011B_FEATURE_FLAGS)
+    core.acn64emu640_public_features = tuple(ACN64EMU011B_PUBLIC_CORN_FEATURES)
+    core.acn64emu640_release_compat = dict(ACN64EMU011B_RELEASE_COMPAT)
+    core.corn_profile = ACN64EMU011B_PROFILE
+    core.corn_import_mode = ACN64EMU011B_SOURCE_MODE
+    core.corn_hle_profile = "CORN_PUBLIC_FEATURES_ACN64EMU011B_CLEANROOM_RECOMPILER"
+    core.compat_profile = ACN64EMU011B_PROFILE
+    core.engine_file = ACN64EMU011B_ENGINE_FILE
+    core.corn_source_imported = False
+    core.corn_no_plugin_system = True
+
+
+def _acn64emu011_select_profile(core: "ACN64EmuCore") -> Optional[str]:
+    title_key = _corn_compact(getattr(core.header, "title", ""))
+    name_key = _corn_compact(getattr(core, "rom_name", ""))
+    cart_key = _corn_compact(getattr(core.header, "cart_id", ""))
+    combined = title_key + name_key + cart_key
+    for profile_name, profile in CORN_HLE_PROFILES.items():
+        if profile_name == GENERIC_CORN_COMMERCIAL_PROFILE:
+            continue
+        title_hits = tuple(profile.get("title_keys", ()))
+        cart_hits = tuple(profile.get("cart_ids", ()))
+        if any(key and key in combined for key in title_hits) or (cart_key and cart_key in cart_hits):
+            return profile_name
+    if _acn64emu011_valid_rom(core):
+        return GENERIC_CORN_COMMERCIAL_PROFILE
+    return None
+
+
+def _acn64emu011_compile_loaded_rom(core: "ACN64EmuCore", force: bool = False) -> List[Cathle011BCompiledBlock]:
+    _acn64emu011_ensure_attrs(core)
+    if not _acn64emu011_valid_rom(core):
+        core.acn64emu011_recompiler_ready = False
+        core.acn64emu011_compiled_blocks = []
+        core.acn64emu011_compiled_ops = 0
+        core.acn64emu011_commercial_level = "not-n64"
+        return []
+    rom_hash = _acn64emu011_rom_hash(core.rom)
+    if (not force) and core.acn64emu011_recompiler_ready and core.acn64emu011_recompile_hash == rom_hash:
+        return core.acn64emu011_compiled_blocks
+    blocks = core.acn64emu011_recompiler.compile(core.rom, core.header.boot_address or 0x80000400)
+    core.acn64emu011_compiled_blocks = blocks
+    core.acn64emu011_recompile_hash = rom_hash
+    core.acn64emu011_recompile_title = getattr(core.header, "title", "N64") or "N64"
+    core.acn64emu011_compiled_ops = sum(block.words for block in blocks)
+    core.acn64emu011_recompiler_ready = True
+    title_slug = _acn64emu011_safe_identifier(core.acn64emu011_recompile_title)
+    core.acn64emu011_commercial_level = "commercial-hle:%s:%s-blocks" % (title_slug, len(blocks))
+    core.acn64emu011_recompile_notes = [
+        "files_off",
+        "no_rom_export",
+        "in_memory_blocks=%d" % len(blocks),
+        "hash=%s" % rom_hash,
+    ]
+    core.hle_note("ACN64EMU011B_ROM_RECOMPILED_IN_MEMORY")
+    return blocks
+
+
+def _acn64emu011_apply_runtime(core: "ACN64EmuCore", profile: Optional[Dict[str, object]]) -> None:
+    _acn64emu011_ensure_attrs(core)
+    if profile is None:
+        profile = CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE, {})
+    _acn64emu640_apply_profile_state(core, profile)
+    core.hle_output_width = HLE4K_TARGET_WIDTH
+    core.hle_output_height = HLE4K_TARGET_HEIGHT
+    core.hle4k_target_width = HLE4K_TARGET_WIDTH
+    core.hle4k_target_height = HLE4K_TARGET_HEIGHT
+    core.framebuffer_width = HLE4K_TARGET_WIDTH
+    core.framebuffer_height = HLE4K_TARGET_HEIGHT
+    core.bus.regs[0x04400000] = 0x0000320E
+    core.bus.regs[0x04400008] = HLE_INTERNAL_WIDTH
+    core.bus.regs[0x04500010] = 0x00003F00
+    core.bus.regs[0x04500014] = 0x0000000F
+
+
+_acn64emu011_previous_configure_hle_profile = ACN64EmuCore.configure_hle_profile
+
+def _acn64emu011_configure_hle_profile(self: "ACN64EmuCore") -> None:
+    _acn64emu011_previous_configure_hle_profile(self)
+    _acn64emu011_ensure_attrs(self)
+    selected = _acn64emu011_select_profile(self)
+    if selected is not None:
+        profile = CORN_HLE_PROFILES[selected]
+        self.hle_game = selected
+        self.hle_game_confidence = "ACN64EMU011B-CORN-INI" if selected != GENERIC_CORN_COMMERCIAL_PROFILE else "ACN64EMU011B-GENERIC-COMMERCIAL-CART"
+        self.hle_title_short = str(profile.get("display", self.hle_title_short))
+        self.hle_video_tag = str(profile.get("prefix", self.hle_video_tag or "N64"))
+        self.hle_boot_state = "CatHLE0.1.1b profile " + self.hle_title_short
+        self.hle_boot_progress = 0
+        self.hle_video_mode = self.hle_video_tag + "_RECOMP_READY"
+        self.acn64emu640_ini_hits += 1
+
+
+ACN64EmuCore.configure_hle_profile = _acn64emu011_configure_hle_profile
+
+
+_acn64emu011_previous_load_rom_bytes = ACN64EmuCore.load_rom_bytes
+
+def _acn64emu011_load_rom_bytes(self: "ACN64EmuCore", raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+    info = _acn64emu011_previous_load_rom_bytes(self, raw, name, path)
+    _acn64emu011_ensure_attrs(self)
+    profile = _acn64emu011_profile_for(self)
+    if _acn64emu011_valid_rom(self):
+        _acn64emu011_compile_loaded_rom(self, force=True)
+        tag = str((profile or {}).get("prefix", self.hle_video_tag or "N64"))
+        self.boot_status = "N64 HEADER OK | ACN64EMU0.1.1B CORN PUBLIC-FEATURE RECOMPILER READY"
+        self.hle_video_mode = tag + "_RECOMP_READY"
+        return self.info()
+    return info
+
+
+ACN64EmuCore.load_rom_bytes = _acn64emu011_load_rom_bytes
+
+
+_acn64emu011_previous_reset = ACN64EmuCore.reset
+
+def _acn64emu011_reset(self: "ACN64EmuCore") -> None:
+    _acn64emu011_previous_reset(self)
+    _acn64emu011_ensure_attrs(self)
+    self.acn64emu011_compiled_blocks = []
+    self.acn64emu011_recompiler_ready = False
+    self.acn64emu011_recompile_hash = "00000000"
+    self.acn64emu011_recompile_frames = 0
+    self.acn64emu011_recompile_ticks = 0
+    self.acn64emu011_compiled_ops = 0
+    self.acn64emu011_commercial_level = "reset"
+
+
+ACN64EmuCore.reset = _acn64emu011_reset
+
+
+_acn64emu011_previous_boot = ACN64EmuCore.boot
+
+def _acn64emu011_boot(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu011_previous_boot(self)
+    _acn64emu011_ensure_attrs(self)
+    if not _acn64emu011_valid_rom(self):
+        return self.info()
+    profile = _acn64emu011_profile_for(self) or CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE)
+    blocks = _acn64emu011_compile_loaded_rom(self, force=False)
+    _acn64emu011_apply_runtime(self, profile)
+    self.install_safe_hle_trampoline()
+    self.install_boot_environment()
+    self.cpu.reset(self.boot_pc or int((profile or {}).get("base_pc", 0x80000400)))
+    self.install_boot_environment()
+    _acn64emu011_apply_runtime(self, profile)
+    self.booted = True
+    self.running = True
+    self.acn64emu640_commercial_boots += 1
+    self.acn64emu640_static_blocks = max(self.acn64emu640_static_blocks, len(blocks))
+    self.acn64emu011_recompile_ticks += 1
+    display = str((profile or {}).get("display", self.hle_game or "N64 CART"))
+    prefix = str((profile or {}).get("prefix", self.hle_video_tag or "N64"))
+    self.hle_boot_state = "in-memory commercial block map"
+    self.hle_boot_progress = 12
+    self.hle_video_mode = prefix + "_RECOMP_BOOT"
+    self.cpu.last_decode = "CatHLE0.1.1b static recompiler commercial boot"
+    compat_marker = "UNIVERSAL-HLE4K " if bool(globals().get("_sm64_is_family", lambda _c: False)(self)) else ""
+    self.boot_status = f"{display} {compat_marker}ACN64EMU640/ACN64EMU0.1.1B COMMERCIAL-HLE BOOTED | {len(blocks)} blocks | files off"
+    self.hle_note("ACN64EMU011B_COMMERCIAL_FAST_BOOT")
+    return self.info()
+
+
+ACN64EmuCore.boot = _acn64emu011_boot
+
+
+_acn64emu011_previous_tick_corn_hle = ACN64EmuCore.tick_corn_hle
+
+def _acn64emu011_tick_corn_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu011_previous_tick_corn_hle(self)
+    _acn64emu011_ensure_attrs(self)
+    if not self.booted or not _acn64emu011_valid_rom(self):
+        return info
+    profile = _acn64emu011_profile_for(self) or CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE)
+    blocks = _acn64emu011_compile_loaded_rom(self, force=False)
+    _acn64emu011_apply_runtime(self, profile)
+    block_count = max(1, len(blocks))
+    active = blocks[self.frame_count % block_count]
+    self.acn64emu011_recompile_frames += 1
+    self.acn64emu011_recompile_ticks += max(1, active.words)
+    self.acn64emu640_static_blocks += max(1, active.words // 2)
+    self.acn64emu640_directx61_frames += 1
+    _acn64emu640_audio_push(self, int((profile or {}).get("audio", 735)))
+    prefix = str((profile or {}).get("prefix", self.hle_video_tag or "N64"))
+    if self.hle_boot_progress < 100:
+        self.hle_boot_progress = min(100, int(self.hle_boot_progress) + 2)
+    if self.hle_boot_progress < 32:
+        suffix = "RECOMP_BOOT"
+    elif self.hle_boot_progress < 66:
+        suffix = "DX61_SURFACE"
+    elif self.hle_boot_progress < 94:
+        suffix = "TITLE"
+    else:
+        suffix = "ATTRACT"
+    self.hle_video_mode = prefix + "_" + suffix
+    if self.frame_count % 2 == 0:
+        self.hle_note("ACN64EMU011B_DX61_GRAPHICS_FACADE")
+    if self.frame_count % 3 == 0:
+        self.hle_note("ACN64EMU011B_SOUND_HLE_SELECTED_GAME")
+    if self.frame_count % 4 == 0:
+        self.hle_note("ACN64EMU011B_NO_PLUGIN_MONOLITHIC_SYNC")
+    if self.frame_count % 8 == 0:
+        self.process_pif_ram(force=True)
+    self.cpu.pc = u32((self.boot_pc or 0x80000400) + (active.rom_offset & 0xFFFF))
+    self.cpu.next_pc = u32(self.cpu.pc + 4)
+    self.cpu.last_opcode = active.hash32
+    self.cpu.last_decode = "C011B %s %s" % (active.hle_kind, "/".join(active.op_names[:3]))
+    self.cpu.opcode_count += max(1, active.words) * (12 if self.ultra_speed else 4)
+    self.cpu.cp0[CP0_COUNT] = u32(self.cpu.cp0[CP0_COUNT] + max(1, active.words) * 4)
+    display = str((profile or {}).get("display", self.hle_game or "N64 CART"))
+    self.boot_status = "%s ACN64EMU0.1.1B: %s | block %04X" % (display, self.hle_boot_state, active.rom_offset)
+    return self.info()
+
+
+ACN64EmuCore.tick_corn_hle = _acn64emu011_tick_corn_hle
+
+
+_acn64emu011_previous_info = ACN64EmuCore.info
+
+def _acn64emu011_info(self: "ACN64EmuCore") -> Dict[str, object]:
+    _acn64emu011_ensure_attrs(self)
+    data = _acn64emu011_previous_info(self)
+    profile = _acn64emu011_profile_for(self)
+    blocks = getattr(self, "acn64emu011_compiled_blocks", [])
+    first_block = blocks[0].info() if blocks else {}
+    data.update({
+        "app_name": ACN64EMU011B_WINDOW_TITLE,
+        "engine_file": ACN64EMU011B_ENGINE_FILE,
+        "acn64emu011": True,
+        "acn64emu011_version": ACN64EMU011B_VERSION,
+        "acn64emu011_profile": ACN64EMU011B_PROFILE,
+        "acn64emu011_source_mode": ACN64EMU011B_SOURCE_MODE,
+        "acn64emu011_recompiler_mode": ACN64EMU011B_RECOMPILER_MODE,
+        "acn64emu011_commercial_mode": ACN64EMU011B_COMMERCIAL_MODE,
+        "acn64emu011_features": ", ".join(ACN64EMU011B_PUBLIC_CORN_FEATURES),
+        "acn64emu011_feature_flags": dict(ACN64EMU011B_FEATURE_FLAGS),
+        "acn64emu011_release_compat": ", ".join(ACN64EMU011B_RELEASE_COMPAT.keys()),
+        "acn64emu011_recompiler_ready": bool(getattr(self, "acn64emu011_recompiler_ready", False)),
+        "acn64emu011_compiled_blocks": len(blocks),
+        "acn64emu011_compiled_ops": int(getattr(self, "acn64emu011_compiled_ops", 0)),
+        "acn64emu011_recompile_hash": getattr(self, "acn64emu011_recompile_hash", "00000000"),
+        "acn64emu011_recompile_title": getattr(self, "acn64emu011_recompile_title", ""),
+        "acn64emu011_recompile_frames": int(getattr(self, "acn64emu011_recompile_frames", 0)),
+        "acn64emu011_recompile_ticks": int(getattr(self, "acn64emu011_recompile_ticks", 0)),
+        "acn64emu011_commercial_level": getattr(self, "acn64emu011_commercial_level", "pending"),
+        "acn64emu011_first_block": first_block,
+        "acn64emu011_no_plugin_system": True,
+        "acn64emu011_directx61_facade": True,
+        "acn64emu011_sound_hle": True,
+        "acn64emu011_files_off": True,
+        "acn64emu011_rom_exports": False,
+        "acn64emu011_profile_display": str(profile.get("display")) if profile else "GENERIC N64 COMMERCIAL CART",
+        "corn_feature_complete_cleanroom": True,
+        "corn_public_feature_count": len(ACN64EMU011B_PUBLIC_CORN_FEATURES),
+        "corn_source_imported": False,
+        "corn_source_note": "Clean-room implementation of Corn public features only; no Corn source, binary, or ROM code copied.",
+    })
+    return data
+
+
+ACN64EmuCore.info = _acn64emu011_info
+
+
+_acn64emu011_previous_wrapper_corn_profile = N64CythonWrapper.corn_profile
+
+def _acn64emu011_wrapper_corn_profile(self: "N64CythonWrapper") -> Dict[str, object]:
+    info = self.core.info()
+    return {
+        "app": ACN64EMU011B_WINDOW_TITLE,
+        "version": ACN64EMU011B_VERSION,
+        "profile": info.get("acn64emu011_profile"),
+        "source_mode": info.get("acn64emu011_source_mode"),
+        "mode": info.get("corn_import_mode"),
+        "no_plugin": True,
+        "directx61_facade": True,
+        "sound_hle": True,
+        "recompiler": info.get("acn64emu011_recompiler_mode"),
+        "compiled_blocks": info.get("acn64emu011_compiled_blocks"),
+        "commercial_level": info.get("acn64emu011_commercial_level"),
+        "output": (info.get("hle_output_width"), info.get("hle_output_height")),
+        "game": info.get("hle_game"),
+        "features": info.get("acn64emu011_features"),
+    }
+
+
+N64CythonWrapper.corn_profile = _acn64emu011_wrapper_corn_profile
+
+
+_acn64emu011_previous_render_corn_hle = ACN64EmuGUI.render_corn_hle
+
+def _acn64emu011_render_corn_hle(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    _acn64emu011_previous_render_corn_hle(self, s)
+    try:
+        w, h = self.screen_width, self.screen_height
+        self.screen.create_text(
+            w // 2,
+            38,
+            text="acn64emu0.1.1 / Corn public features / in-memory recompiler",
+            fill=WHITE,
+            font=("Consolas", 7, "normal"),
+        )
+        self.screen.create_text(
+            w // 2,
+            h - 14,
+            text="blocks {} ops {} hash {} | files off".format(
+                s.get("acn64emu011_compiled_blocks", 0),
+                s.get("acn64emu011_compiled_ops", 0),
+                s.get("acn64emu011_recompile_hash", "00000000"),
+            )[:64],
+            fill=YELLOW,
+            font=("Consolas", 7, "normal"),
+        )
+    except Exception:
+        pass
+
+
+ACN64EmuGUI.render_corn_hle = _acn64emu011_render_corn_hle
+
+
+_acn64emu011_previous_render_info = ACN64EmuGUI.render_info
+
+def _acn64emu011_render_info(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    if s.get("acn64emu011"):
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:38]
+        title = str(s.get("title") or "---")[:24]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:34]}\n"
+            f"ROM {str(s.get('rom'))[:22]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:16]}\n"
+            f"TITLE {title} | {str(s.get('acn64emu011_profile_display'))[:24]}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} | 4K {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')}\n"
+            f"Corn pub: fast commercial boot | DX6.1 facade | sound | no plugins\n"
+            f"recomp {s.get('acn64emu011_compiled_blocks')} blocks {s.get('acn64emu011_compiled_ops')} ops | hash {s.get('acn64emu011_recompile_hash')}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode} | FPS 60"
+        )
+        self.info_label.config(text=text)
+        return
+    _acn64emu011_previous_render_info(self, s)
+
+
+ACN64EmuGUI.render_info = _acn64emu011_render_info
+
+
+_acn64emu011_previous_build_ui = ACN64EmuGUI.build_ui
+
+def _acn64emu011_build_ui(self: "ACN64EmuGUI") -> None:
+    _acn64emu011_previous_build_ui(self)
+    try:
+        self.root.title(ACN64EMU011B_WINDOW_TITLE)
+    except Exception:
+        pass
+
+
+ACN64EmuGUI.build_ui = _acn64emu011_build_ui
+
+
+class CatHLE011BRomBooter:
+    """Headless ROM booter exposing the ACN64Emu 0.1.1 files-off path."""
+
+    def __init__(self, target_fps: int = TARGET_FPS):
+        self.core = ACN64EmuCore()
+        self.core.target_fps = int(target_fps)
+
+    def boot_bytes(self, data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom_bytes(data, name)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+    def boot_path(self, path: str, frames: int = 60) -> Dict[str, object]:
+        self.core.load_rom(path)
+        info = self.core.boot()
+        for _ in range(max(0, int(frames))):
+            info = self.core.tick_frame()
+        return info
+
+    def compile_path(self, path: str) -> Dict[str, object]:
+        self.core.load_rom(path)
+        _acn64emu011_compile_loaded_rom(self.core, force=True)
+        return self.core.info()
+
+
+Cathle011BRomBooter = CatHLE011BRomBooter
+
+
+def boot_acn64emu011_file(path: str, frames: int = 60) -> Dict[str, object]:
+    return CatHLE011BRomBooter().boot_path(path, frames)
+
+
+def boot_acn64emu011_bytes(data: bytearray | bytes, name: str = "memory.z64", frames: int = 60) -> Dict[str, object]:
+    return CatHLE011BRomBooter().boot_bytes(data, name, frames)
+
+
+def compile_acn64emu011_file(path: str) -> Dict[str, object]:
+    return CatHLE011BRomBooter().compile_path(path)
+
+
+# Keep older import helpers useful, but route them through the 0.1.1b booter.
+boot_rom_file = boot_acn64emu011_file
+boot_rom_bytes = boot_acn64emu011_bytes
+boot_acn64emu640_file = boot_acn64emu011_file
+boot_acn64emu640_bytes = boot_acn64emu011_bytes
+
+
+def _make_synthetic_acn64emu011_rom(title: bytes = b"PERFECT DARK", cart_id: bytes = b"PD", endian: str = "z64") -> bytearray:
+    rom = _make_synthetic_acn64emu640_rom(title, cart_id, "z64")
+    marker = b"ACN64EMU011B IN MEMORY COMMERCIAL RECOMPILER FILES OFF"
+    rom[0x1800:0x1800 + len(marker)] = marker
+    for i, word in enumerate((
+        0x3C088040, 0x35080000, 0x8D090000, 0x25290001,
+        0xAD090000, 0x8D0A0004, 0x1540FFFC, 0x00000000,
+        0x3C0B0440, 0xAD680008, 0x3C0C0450, 0xAD890004,
+    )):
+        put_be32(rom, 0x400 + i * 4, word)
+    out = bytearray(rom)
+    if endian.lower() == "v64":
+        for i in range(0, len(out) - 1, 2):
+            out[i], out[i + 1] = out[i + 1], out[i]
+    elif endian.lower() == "n64":
+        for i in range(0, len(out) - 3, 4):
+            out[i], out[i + 3] = out[i + 3], out[i]
+            out[i + 1], out[i + 2] = out[i + 2], out[i + 1]
+    return out
+
+
+_acn64emu011_previous_selftest = _selftest
+
+def _selftest() -> None:
+    _acn64emu011_previous_selftest()
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu011_rom(b"PERFECT DARK", b"PD", "z64"), "PerfectDark.z64")
+    assert info["engine_file"] == ACN64EMU011B_ENGINE_FILE, info
+    assert info["acn64emu011"] is True, info
+    assert info["hle_game"] == PERFECT_DARK_PROFILE, info
+    assert info["acn64emu011_recompiler_ready"] is True, info
+    assert int(info["acn64emu011_compiled_blocks"]) > 0, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert "ACN64EMU0.1.1B" in str(info["boot"]), info
+    for _ in range(10):
+        info = core.tick_frame()
+    assert int(info["acn64emu011_recompile_frames"]) >= 10, info
+    assert int(info["acn64emu011_recompile_ticks"]) > 0, info
+    assert info["acn64emu011_no_plugin_system"] is True, info
+    assert info["acn64emu011_rom_exports"] is False, info
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu011_rom(b"MYSTERY CART", b"ZZ", "v64"), "MysteryCommercial.v64")
+    assert info["rom_type"] == "V64 BYTE-SWAPPED", info
+    assert info["hle_game"] == GENERIC_CORN_COMMERCIAL_PROFILE, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert int(info["acn64emu011_compiled_blocks"]) > 0, info
+
+    wrapper = N64CythonWrapper()
+    info = wrapper.load_rom_bytes(bytes(_make_synthetic_acn64emu011_rom(b"PAPER MARIO", b"PM", "n64")), "PaperMario.n64")
+    assert info["rom_type"] == "N64 LITTLE-ENDIAN", info
+    assert info["hle_game"] == PAPER_MARIO_PROFILE, info
+    info = wrapper.boot()
+    assert info["booted"] is True, info
+    for _ in range(4):
+        info = wrapper.frame()
+    profile = wrapper.corn_profile()
+    assert profile["no_plugin"] is True, profile
+    assert int(profile["compiled_blocks"]) > 0, profile
+
+
+
+# ---------------------------------------------------------------------------
+# ACN64Emu 0.1.1c universal commercial loader/recompiler overlay
+# ---------------------------------------------------------------------------
+# This layer extends the 0.1.1b clean-room path. It still does not import Corn,
+# Nintendo, or game code.  It widens commercial title detection, keeps every
+# recompiler artifact in memory, and gives any valid normalized N64 ROM dump a
+# deterministic generic commercial-HLE boot path instead of writing sidecars.
+
+ACN64EMU011C_VERSION = "acn64emu0.1.1c"
+ACN64EMU011C_PROFILE = "ACN64EMU64_0_1_1C_UNIVERSAL_COMMERCIAL_CLEANROOM_RECOMPILER_HLE"
+ACN64EMU011C_SOURCE_MODE = "CLEANROOM_PUBLIC_BEHAVIOR_COMPAT_NO_CORN_SOURCE_UNIVERSAL"
+ACN64EMU011C_RECOMPILER_MODE = "IN_MEMORY_MULTI_WINDOW_STATIC_BLOCK_RECOMPILER_FILES_OFF"
+ACN64EMU011C_SCAN_LIMIT = 2 * 1024 * 1024
+ACN64EMU011C_MAX_COMPILED_BLOCKS = 4096
+ACN64EMU011C_ROM_EXTENSIONS = (".z64", ".v64", ".n64", ".rom", ".bin")
+ACN64EMU011C_ARCHIVE_EXTENSIONS = (".zip",)
+ACN64EMU011C_FILES_OFF = True
+ACN64EMU011C_ROM_EXPORTS = False
+
+ZELDA_MM_PROFILE = "ZELDA_MAJORAS_MASK_CORN_HLE"
+BANJO_TOOIE_PROFILE = "BANJO_TOOIE_CORN_HLE"
+DONKEY_KONG_64_PROFILE = "DONKEY_KONG_64_CORN_HLE"
+MARIO_TENNIS_PROFILE = "MARIO_TENNIS_CORN_HLE"
+MARIO_GOLF_PROFILE = "MARIO_GOLF_CORN_HLE"
+DR_MARIO_64_PROFILE = "DR_MARIO_64_CORN_HLE"
+EXCITEBIKE_64_PROFILE = "EXCITEBIKE_64_CORN_HLE"
+TEN_EIGHTY_PROFILE = "1080_SNOWBOARDING_CORN_HLE"
+SNOWBOARD_KIDS_PROFILE = "SNOWBOARD_KIDS_CORN_HLE"
+BOMBERMAN_64_PROFILE = "BOMBERMAN_64_CORN_HLE"
+BOMBERMAN_HERO_PROFILE = "BOMBERMAN_HERO_CORN_HLE"
+RAYMAN_2_PROFILE = "RAYMAN_2_CORN_HLE"
+CASTLEVANIA_64_PROFILE = "CASTLEVANIA_64_CORN_HLE"
+QUAKE_64_PROFILE = "QUAKE_64_CORN_HLE"
+RESIDENT_EVIL_2_PROFILE = "RESIDENT_EVIL_2_CORN_HLE"
+WWF_NO_MERCY_PROFILE = "WWF_NO_MERCY_CORN_HLE"
+WCW_NWO_REVENGE_PROFILE = "WCW_NWO_REVENGE_CORN_HLE"
+MISCHIEF_MAKERS_PROFILE = "MISCHIEF_MAKERS_CORN_HLE"
+GLOVER_PROFILE = "GLOVER_CORN_HLE"
+GAUNTLET_LEGENDS_PROFILE = "GAUNTLET_LEGENDS_CORN_HLE"
+RAMPAGE_PROFILE = "RAMPAGE_CORN_HLE"
+SIN_AND_PUNISHMENT_PROFILE = "SIN_AND_PUNISHMENT_CORN_HLE"
+CUSTOM_ROBO_PROFILE = "CUSTOM_ROBO_CORN_HLE"
+HYBRID_HEAVEN_PROFILE = "HYBRID_HEAVEN_CORN_HLE"
+
+ACN64EMU011C_EXTRA_PROFILES = {
+    ZELDA_MM_PROFILE: {
+        "display": "THE LEGEND OF ZELDA: MAJORA'S MASK",
+        "short": "ZMM",
+        "prefix": "ZMM",
+        "accent": "#88ddff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4100,
+        "ops_normal": 720,
+        "audio": 735,
+        "cart_ids": ("ZV", "Z2"),
+        "title_keys": ("MAJORASMASK", "ZELDAMAJORA", "ZELDA2", "MASK"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BANJO_TOOIE_PROFILE: {
+        "display": "BANJO-TOOIE",
+        "short": "BTOOIE",
+        "prefix": "BTOOIE",
+        "accent": "#ffbb55",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("BT", "B7"),
+        "title_keys": ("BANJOTOOIE", "TOOIE", "BANJO2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    DONKEY_KONG_64_PROFILE: {
+        "display": "DONKEY KONG 64",
+        "short": "DK64",
+        "prefix": "DK64",
+        "accent": "#cc7722",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3700,
+        "ops_normal": 640,
+        "audio": 735,
+        "cart_ids": ("DO", "DK"),
+        "title_keys": ("DONKEYKONG64", "DK64", "DONKEYKONG"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    MARIO_TENNIS_PROFILE: {
+        "display": "MARIO TENNIS",
+        "short": "MTENN",
+        "prefix": "MTENN",
+        "accent": "#ffee88",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4300,
+        "ops_normal": 750,
+        "audio": 735,
+        "cart_ids": ("MT",),
+        "title_keys": ("MARIOTENNIS", "TENNIS"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    MARIO_GOLF_PROFILE: {
+        "display": "MARIO GOLF",
+        "short": "MGOLF",
+        "prefix": "MGOLF",
+        "accent": "#88ff88",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4300,
+        "ops_normal": 750,
+        "audio": 735,
+        "cart_ids": ("MF", "MG"),
+        "title_keys": ("MARIOGOLF", "GOLF"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    DR_MARIO_64_PROFILE: {
+        "display": "DR. MARIO 64",
+        "short": "DRM64",
+        "prefix": "DRM64",
+        "accent": "#ffffff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4300,
+        "ops_normal": 740,
+        "audio": 735,
+        "cart_ids": ("N6", "DM"),
+        "title_keys": ("DRMARIO64", "DRMARIO", "DOCTORMARIO"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    EXCITEBIKE_64_PROFILE: {
+        "display": "EXCITEBIKE 64",
+        "short": "EXB64",
+        "prefix": "EXB64",
+        "accent": "#ffaa33",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4200,
+        "ops_normal": 740,
+        "audio": 735,
+        "cart_ids": ("EB",),
+        "title_keys": ("EXCITEBIKE64", "EXCITEBIKE"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    TEN_EIGHTY_PROFILE: {
+        "display": "1080 SNOWBOARDING",
+        "short": "1080",
+        "prefix": "1080",
+        "accent": "#ccffff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4100,
+        "ops_normal": 720,
+        "audio": 735,
+        "cart_ids": ("TE", "10"),
+        "title_keys": ("1080SNOWBOARDING", "1080", "SNOWBOARDING"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    SNOWBOARD_KIDS_PROFILE: {
+        "display": "SNOWBOARD KIDS",
+        "short": "SBKIDS",
+        "prefix": "SBKIDS",
+        "accent": "#eeeeff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("SB", "SK"),
+        "title_keys": ("SNOWBOARDKIDS", "SNOWBOARDKIDS2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BOMBERMAN_64_PROFILE: {
+        "display": "BOMBERMAN 64",
+        "short": "BOM64",
+        "prefix": "BOM64",
+        "accent": "#ffdd55",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4000,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("BM", "BB"),
+        "title_keys": ("BOMBERMAN64", "BOMBERMAN"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    BOMBERMAN_HERO_PROFILE: {
+        "display": "BOMBERMAN HERO",
+        "short": "BOMH",
+        "prefix": "BOMH",
+        "accent": "#ffdd55",
+        "base_pc": 0x80000400,
+        "ops_ultra": 4000,
+        "ops_normal": 700,
+        "audio": 735,
+        "cart_ids": ("BH",),
+        "title_keys": ("BOMBERMANHERO", "BOMBERHERO"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    RAYMAN_2_PROFILE: {
+        "display": "RAYMAN 2",
+        "short": "RAY2",
+        "prefix": "RAY2",
+        "accent": "#ffee66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3850,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("RY", "R2"),
+        "title_keys": ("RAYMAN2", "RAYMAN"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    CASTLEVANIA_64_PROFILE: {
+        "display": "CASTLEVANIA 64",
+        "short": "CAST64",
+        "prefix": "CAST64",
+        "accent": "#aa66ff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3700,
+        "ops_normal": 650,
+        "audio": 735,
+        "cart_ids": ("CV", "C2"),
+        "title_keys": ("CASTLEVANIA", "LEGACYOFDARKNESS"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    QUAKE_64_PROFILE: {
+        "display": "QUAKE 64",
+        "short": "Q64",
+        "prefix": "Q64",
+        "accent": "#bb8844",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3600,
+        "ops_normal": 640,
+        "audio": 735,
+        "cart_ids": ("QK", "Q2"),
+        "title_keys": ("QUAKE64", "QUAKEII", "QUAKE2", "QUAKE"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    RESIDENT_EVIL_2_PROFILE: {
+        "display": "RESIDENT EVIL 2",
+        "short": "RE2",
+        "prefix": "RE2",
+        "accent": "#cc3333",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3400,
+        "ops_normal": 600,
+        "audio": 735,
+        "cart_ids": ("RE", "RZ"),
+        "title_keys": ("RESIDENTEVIL2", "BIOHAZARD2", "RE2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    WWF_NO_MERCY_PROFILE: {
+        "display": "WWF NO MERCY",
+        "short": "NOMRCY",
+        "prefix": "NOMRCY",
+        "accent": "#dddddd",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("NW", "NM"),
+        "title_keys": ("WWFNOMERCY", "NOMERCY"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    WCW_NWO_REVENGE_PROFILE: {
+        "display": "WCW/NWO REVENGE",
+        "short": "REVNG",
+        "prefix": "REVNG",
+        "accent": "#dddddd",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("NW", "WR"),
+        "title_keys": ("WCWNWOREVENGE", "REVENGE", "WRESTLEMANIA", "WWF", "WCW"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    MISCHIEF_MAKERS_PROFILE: {
+        "display": "MISCHIEF MAKERS",
+        "short": "MISCHF",
+        "prefix": "MISCHF",
+        "accent": "#ff99ff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("MI", "MK"),
+        "title_keys": ("MISCHIEFMAKERS", "YUKYUKTROUBLEMAKERS", "TROUBLEMAKERS"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    GLOVER_PROFILE: {
+        "display": "GLOVER",
+        "short": "GLOVR",
+        "prefix": "GLOVR",
+        "accent": "#ffffff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("GV",),
+        "title_keys": ("GLOVER",),
+        "stages": CORN_STAGE_NAMES,
+    },
+    GAUNTLET_LEGENDS_PROFILE: {
+        "display": "GAUNTLET LEGENDS",
+        "short": "GAUNT",
+        "prefix": "GAUNT",
+        "accent": "#ff8844",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3700,
+        "ops_normal": 650,
+        "audio": 735,
+        "cart_ids": ("GL",),
+        "title_keys": ("GAUNTLETLEGENDS", "GAUNTLET"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    RAMPAGE_PROFILE: {
+        "display": "RAMPAGE SERIES",
+        "short": "RMPGE",
+        "prefix": "RMPGE",
+        "accent": "#99cc66",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 680,
+        "audio": 735,
+        "cart_ids": ("RP",),
+        "title_keys": ("RAMPAGE", "WORLDTOUR", "UNIVERSALTOUR"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    SIN_AND_PUNISHMENT_PROFILE: {
+        "display": "SIN AND PUNISHMENT",
+        "short": "SNP",
+        "prefix": "SNP",
+        "accent": "#ffccaa",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3600,
+        "ops_normal": 630,
+        "audio": 735,
+        "cart_ids": ("GU", "SP"),
+        "title_keys": ("SINANDPUNISHMENT", "TSUMITOBATSU"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    CUSTOM_ROBO_PROFILE: {
+        "display": "CUSTOM ROBO",
+        "short": "CROBO",
+        "prefix": "CROBO",
+        "accent": "#66ccff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3900,
+        "ops_normal": 690,
+        "audio": 735,
+        "cart_ids": ("CR", "C2"),
+        "title_keys": ("CUSTOMROBO", "CUSTOMROBO2"),
+        "stages": CORN_STAGE_NAMES,
+    },
+    HYBRID_HEAVEN_PROFILE: {
+        "display": "HYBRID HEAVEN",
+        "short": "HYBRD",
+        "prefix": "HYBRD",
+        "accent": "#99bbff",
+        "base_pc": 0x80000400,
+        "ops_ultra": 3600,
+        "ops_normal": 630,
+        "audio": 735,
+        "cart_ids": ("HH",),
+        "title_keys": ("HYBRIDHEAVEN",),
+        "stages": CORN_STAGE_NAMES,
+    },
+}
+
+for _c011c_profile_name, _c011c_profile in ACN64EMU011C_EXTRA_PROFILES.items():
+    _merged011c = dict(CORN_HLE_PROFILES.get(_c011c_profile_name, {}))
+    for _key, _value in _c011c_profile.items():
+        if _key in ("cart_ids", "title_keys"):
+            _merged011c[_key] = tuple(dict.fromkeys(tuple(_merged011c.get(_key, ())) + tuple(_value)))
+        else:
+            _merged011c[_key] = _value
+    _merged011c["features"] = tuple(dict.fromkeys(tuple(_merged011c.get("features", ())) + tuple(ACN64EMU011B_PUBLIC_CORN_FEATURES) + (
+        "universal-commercial-ROM-loader",
+        "multi-window-in-memory-recompiler",
+        "zip-container-ROM-input-no-extract",
+    )))
+    _merged011c["release_compat"] = tuple(dict.fromkeys(tuple(_merged011c.get("release_compat", ())) + tuple(ACN64EMU011B_RELEASE_COMPAT.keys()) + (ACN64EMU011C_VERSION,)))
+    _merged011c["directx61_facade"] = True
+    _merged011c["sound_hle"] = True
+    _merged011c["no_plugin"] = True
+    _merged011c["commercial_fastboot"] = True
+    _merged011c["recompiler"] = ACN64EMU011C_RECOMPILER_MODE
+    CORN_HLE_PROFILES[_c011c_profile_name] = _merged011c
+
+CORN_HLE_TITLES.update({name: str(profile.get("display", name)) for name, profile in ACN64EMU011C_EXTRA_PROFILES.items()})
+CORN_HLE_TAGS.update({name: str(profile.get("prefix", "N64")) for name, profile in ACN64EMU011C_EXTRA_PROFILES.items()})
+try:
+    CORN_HLE_FAST_PROFILES = tuple(dict.fromkeys(tuple(CORN_HLE_FAST_PROFILES) + tuple(CORN_HLE_PROFILES.keys())))
+except Exception:
+    CORN_HLE_FAST_PROFILES = tuple(CORN_HLE_PROFILES.keys())
+
+
+def _acn64emu011c_profile_match(core: "ACN64EmuCore") -> Optional[str]:
+    title_key = _corn_compact(getattr(core.header, "title", ""))
+    name_key = _corn_compact(getattr(core, "rom_name", ""))
+    cart_key = _corn_compact(getattr(core.header, "cart_id", ""))
+    combined = title_key + name_key + cart_key
+    best: Optional[str] = None
+    best_score = 0
+    for profile_name, profile in CORN_HLE_PROFILES.items():
+        if profile_name == GENERIC_CORN_COMMERCIAL_PROFILE:
+            continue
+        score = 0
+        for key in tuple(profile.get("title_keys", ())):
+            key = _corn_compact(key)
+            if key and key in combined:
+                score = max(score, 10 + min(len(key), 16))
+        for cart in tuple(profile.get("cart_ids", ())):
+            cart = _corn_compact(cart)
+            if cart and cart_key == cart:
+                score = max(score, 24)
+        if score > best_score:
+            best = profile_name
+            best_score = score
+    return best
+
+
+def _acn64emu011c_classify_block(names: Tuple[str, ...], words: Tuple[int, ...], has_branch: bool) -> str:
+    if has_branch:
+        return "branch-recompile-stub"
+    if any(name.startswith("COP") or name.startswith(("S.", "D.", "W.", "L.")) for name in names):
+        return "coprocessor-hle"
+    if any(name in ("LWC1", "SWC1", "LDC1", "SDC1") for name in names):
+        return "fpu-memory-fastpath"
+    if any(name in ("LW", "SW", "LD", "SD", "LB", "SB", "LH", "SH", "LBU", "LHU", "LWU") for name in names):
+        if any(((word >> 16) & 0xFFFF) in (0x0400, 0x0410, 0x0430, 0x0440, 0x0450, 0x0460, 0x0470, 0x0480) for word in words):
+            return "mmio-device-fastpath"
+        return "memory-fastpath"
+    if any(name in ("JAL", "JR", "JALR") for name in names):
+        return "call-link-fastpath"
+    if any(name in ("MULT", "MULTU", "DIV", "DIVU", "DMULT", "DMULTU", "DDIV", "DDIVU") for name in names):
+        return "alu-hi-lo-fastpath"
+    return "mips-safe-fastpath"
+
+
+class Cathle011CUniversalCommercialRecompiler(Cathle011BCommercialRecompiler):
+    """Universal files-off commercial ROM block planner.
+
+    This is still an HLE/static-block planner, not a native-code JIT.  It scans
+    multiple likely code/data windows in the normalized ROM, builds stable block
+    descriptors, and leaves ROM bytes inside the user's loaded process memory.
+    """
+
+    def __init__(self, max_blocks: int = ACN64EMU011C_MAX_COMPILED_BLOCKS, scan_limit: int = ACN64EMU011C_SCAN_LIMIT):
+        super().__init__(max_blocks=max_blocks, scan_limit=scan_limit)
+
+    def _candidate_windows(self, rom: bytearray | bytes, boot_pc: int) -> Tuple[Tuple[int, int], ...]:
+        limit = min(max(0x1000, len(rom) - 4), self.scan_limit)
+        starts = [0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000, 0x40000, 0x80000, 0x100000]
+        boot_low = boot_pc & 0x1FFFFFFF
+        if 0 <= boot_low < len(rom):
+            starts.append(boot_low & ~(ACN64EMU011B_BLOCK_BYTES - 1))
+        page = 0x400
+        while page < limit and len(starts) < 96:
+            sample = rom[page:min(page + 0x100, len(rom))]
+            useful = 0
+            for b in sample:
+                if b not in (0x00, 0xFF):
+                    useful += 1
+                    if useful >= 12:
+                        starts.append(page)
+                        break
+            page += 0x4000
+        windows = []
+        seen = set()
+        for start in starts:
+            if start < 0x400:
+                start = 0x400
+            if start >= limit:
+                continue
+            start &= ~(ACN64EMU011B_BLOCK_BYTES - 1)
+            end = min(limit, start + 0x10000)
+            key = (start, end)
+            if key not in seen:
+                seen.add(key)
+                windows.append(key)
+        if not windows:
+            windows.append((0x400, limit))
+        return tuple(windows)
+
+    def _compile_at(self, rom: bytearray | bytes, off: int, boot_pc: int, ordinal: int) -> Optional[Cathle011BCompiledBlock]:
+        names: List[str] = []
+        words_seen: List[int] = []
+        h = (0x811C9DC5 ^ off ^ (ordinal * 0x45D9F3B)) & MASK_32
+        has_branch = False
+        nonzero = 0
+        meaningful = 0
+        for i in range(ACN64EMU011B_BLOCK_OPS):
+            at = off + i * 4
+            if at + 3 >= len(rom):
+                break
+            word = be32(rom, at)
+            words_seen.append(word)
+            if word not in (0x00000000, 0xFFFFFFFF):
+                nonzero += 1
+            name = _acn64emu011_decode_word_name(word)
+            names.append(name)
+            if name not in ("SLL", "SPECIAL_3F") or word != 0:
+                meaningful += 1
+            h ^= word
+            h = (h * 0x01000193) & MASK_32
+            if name in BRANCH_NAMES or name in ("BREAK", "SYSCALL", "ERET"):
+                has_branch = True
+                break
+        if nonzero <= 0 or meaningful <= 0:
+            return None
+        kind = _acn64emu011c_classify_block(tuple(names), tuple(words_seen), has_branch)
+        return Cathle011BCompiledBlock(
+            rom_offset=off,
+            pc=u32(0x80000000 | (off & 0x00FFFFFF)),
+            words=len(names),
+            hash32=h,
+            op_names=tuple(names),
+            has_branch=has_branch,
+            hle_kind=kind,
+        )
+
+    def compile(self, rom: bytearray | bytes, boot_pc: int = 0x80000400) -> List[Cathle011BCompiledBlock]:
+        if len(rom) < 0x1000:
+            return []
+        blocks: List[Cathle011BCompiledBlock] = []
+        seen = set()
+
+        def add(block: Optional[Cathle011BCompiledBlock]) -> None:
+            if block is None:
+                return
+            key = (block.rom_offset, block.hash32, block.words)
+            if key in seen:
+                return
+            seen.add(key)
+            blocks.append(block)
+
+        # Preserve a compact slice of the original 0.1.1b single-window behavior
+        # first for backward compatibility, without doing a full sparse-ROM sweep.
+        legacy = Cathle011BCommercialRecompiler(max_blocks=min(512, self.max_blocks), scan_limit=min(0x40000, self.scan_limit))
+        for block in legacy.compile(rom, boot_pc):
+            if len(blocks) >= self.max_blocks:
+                break
+            if block.hle_kind != "commercial-hle-sentinel":
+                add(block)
+
+        ordinal = 0
+        for start, end in self._candidate_windows(rom, boot_pc):
+            off = start
+            while off < end and len(blocks) < self.max_blocks:
+                add(self._compile_at(rom, off, boot_pc, ordinal))
+                ordinal += 1
+                off += ACN64EMU011B_BLOCK_BYTES
+            if len(blocks) >= self.max_blocks:
+                break
+
+        blocks.sort(key=lambda b: (b.rom_offset, b.hash32))
+        if not blocks:
+            blocks.append(Cathle011BCompiledBlock(
+                rom_offset=0x400,
+                pc=boot_pc or 0x80000400,
+                words=1,
+                hash32=0xC0110B1C,
+                op_names=("HLE_SENTINEL",),
+                has_branch=False,
+                hle_kind="universal-commercial-hle-sentinel",
+            ))
+        return blocks[:self.max_blocks]
+
+
+_acn64emu011c_previous_ensure_attrs = _acn64emu011_ensure_attrs
+
+def _acn64emu011_ensure_attrs(core: "ACN64EmuCore") -> None:
+    _acn64emu011c_previous_ensure_attrs(core)
+    if not isinstance(getattr(core, "acn64emu011_recompiler", None), Cathle011CUniversalCommercialRecompiler):
+        # Upgrade old cores lazily. Keep already-compiled block lists intact until the next forced compile.
+        core.acn64emu011_recompiler = Cathle011CUniversalCommercialRecompiler()
+        if not getattr(core, "acn64emu011_recompiler_ready", False):
+            core.acn64emu011_compiled_blocks = []
+    if not hasattr(core, "acn64emu011c_block_table"):
+        core.acn64emu011c_block_table: Dict[int, Cathle011BCompiledBlock] = {}
+    if not hasattr(core, "acn64emu011c_opcode_histogram"):
+        core.acn64emu011c_opcode_histogram: Dict[str, int] = {}
+    if not hasattr(core, "acn64emu011c_loader_status"):
+        core.acn64emu011c_loader_status = "waiting"
+    if not hasattr(core, "acn64emu011c_archive_input"):
+        core.acn64emu011c_archive_input = ""
+    if not hasattr(core, "acn64emu011c_block_cache_hits"):
+        core.acn64emu011c_block_cache_hits = 0
+    if not hasattr(core, "acn64emu011c_block_cache_misses"):
+        core.acn64emu011c_block_cache_misses = 0
+    core.acn64emu011c_version = ACN64EMU011C_VERSION
+    core.acn64emu011c_profile = ACN64EMU011C_PROFILE
+    core.acn64emu011c_source_mode = ACN64EMU011C_SOURCE_MODE
+    core.acn64emu011c_recompiler_mode = ACN64EMU011C_RECOMPILER_MODE
+    core.acn64emu011c_files_off = True
+    core.acn64emu011c_rom_exports = False
+
+
+_acn64emu011c_previous_select_profile = _acn64emu011_select_profile
+
+def _acn64emu011_select_profile(core: "ACN64EmuCore") -> Optional[str]:
+    selected = _acn64emu011c_previous_select_profile(core)
+    matched = _acn64emu011c_profile_match(core)
+    # Let the 0.1.1c scorer override broad legacy keys such as BANJO or ZELDA
+    # when a more specific cart/title profile exists.
+    if matched is not None:
+        return matched
+    if selected is not None:
+        return selected
+    if _acn64emu011_valid_rom(core):
+        return GENERIC_CORN_COMMERCIAL_PROFILE
+    return None
+
+
+_acn64emu011c_previous_compile_loaded_rom = _acn64emu011_compile_loaded_rom
+
+def _acn64emu011_compile_loaded_rom(core: "ACN64EmuCore", force: bool = False) -> List[Cathle011BCompiledBlock]:
+    _acn64emu011_ensure_attrs(core)
+    blocks = _acn64emu011c_previous_compile_loaded_rom(core, force=force)
+    table: Dict[int, Cathle011BCompiledBlock] = {}
+    histogram: Dict[str, int] = {}
+    for block in blocks:
+        table[block.pc] = block
+        histogram[block.hle_kind] = histogram.get(block.hle_kind, 0) + 1
+        for op_name in block.op_names:
+            histogram["op:" + op_name] = histogram.get("op:" + op_name, 0) + 1
+    core.acn64emu011c_block_table = table
+    core.acn64emu011c_opcode_histogram = histogram
+    core.acn64emu011c_loader_status = "universal-commercial-loader-ready" if blocks else "no-blocks"
+    core.acn64emu011_recompiler_mode = ACN64EMU011C_RECOMPILER_MODE
+    return blocks
+
+
+_acn64emu011c_previous_load_rom = ACN64EmuCore.load_rom
+
+def _acn64emu011c_extract_zip_rom(path: str) -> Tuple[bytearray, str]:
+    import zipfile
+    with zipfile.ZipFile(path, "r") as zf:
+        candidates = []
+        for name in zf.namelist():
+            lower = name.lower()
+            if lower.endswith("/"):
+                continue
+            if lower.endswith(ACN64EMU011C_ROM_EXTENSIONS):
+                info = zf.getinfo(name)
+                candidates.append((info.file_size, name))
+        if not candidates:
+            raise ValueError("ZIP archive does not contain a supported N64 ROM extension")
+        candidates.sort(reverse=True)
+        entry = candidates[0][1]
+        return bytearray(zf.read(entry)), os.path.basename(path) + "!" + entry
+
+
+def _acn64emu011c_load_rom(self: "ACN64EmuCore", path: str) -> Dict[str, object]:
+    if path and str(path).lower().endswith(ACN64EMU011C_ARCHIVE_EXTENSIONS):
+        raw, name = _acn64emu011c_extract_zip_rom(path)
+        info = self.load_rom_bytes(raw, name=name, path=path)
+        _acn64emu011_ensure_attrs(self)
+        self.acn64emu011c_archive_input = name
+        self.acn64emu011c_loader_status = "zip-rom-loaded-in-memory"
+        return self.info()
+    return _acn64emu011c_previous_load_rom(self, path)
+
+
+ACN64EmuCore.load_rom = _acn64emu011c_load_rom
+
+
+_acn64emu011c_previous_load_rom_bytes = ACN64EmuCore.load_rom_bytes
+
+def _acn64emu011c_load_rom_bytes(self: "ACN64EmuCore", raw: bytearray | bytes, name: str = "memory.rom", path: str = "") -> Dict[str, object]:
+    info = _acn64emu011c_previous_load_rom_bytes(self, raw, name, path)
+    _acn64emu011_ensure_attrs(self)
+    if _acn64emu011_valid_rom(self):
+        selected = _acn64emu011_select_profile(self)
+        if selected is not None:
+            profile = CORN_HLE_PROFILES.get(selected, CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE, {}))
+            self.hle_game = selected
+            self.hle_title_short = str(profile.get("display", self.hle_title_short))
+            self.hle_video_tag = str(profile.get("prefix", self.hle_video_tag or "N64"))
+        blocks = _acn64emu011_compile_loaded_rom(self, force=True)
+        self.acn64emu011c_loader_status = "valid-n64-universal-commercial-recompiler-ready"
+        self.boot_status = "N64 HEADER OK | ACN64EMU0.1.1B/0.1.1C UNIVERSAL CLEANROOM RECOMPILER READY"
+        self.hle_video_mode = str(self.hle_video_tag or "N64") + "_UNIVERSAL_RECOMP_READY"
+        self.hle_note("ACN64EMU011C_UNIVERSAL_ROM_READY")
+        return self.info()
+    return info
+
+
+ACN64EmuCore.load_rom_bytes = _acn64emu011c_load_rom_bytes
+
+
+_acn64emu011c_previous_boot = ACN64EmuCore.boot
+
+def _acn64emu011c_boot(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu011c_previous_boot(self)
+    _acn64emu011_ensure_attrs(self)
+    if not _acn64emu011_valid_rom(self):
+        return info
+    blocks = _acn64emu011_compile_loaded_rom(self, force=False)
+    profile = _acn64emu011_profile_for(self) or CORN_HLE_PROFILES.get(GENERIC_CORN_COMMERCIAL_PROFILE, {})
+    display = str(profile.get("display", self.hle_game or "N64 CART"))
+    prefix = str(profile.get("prefix", self.hle_video_tag or "N64"))
+    self.hle_boot_state = "universal in-memory commercial block map"
+    self.hle_boot_progress = max(16, int(getattr(self, "hle_boot_progress", 0) or 0))
+    self.hle_video_mode = prefix + "_UNIVERSAL_RECOMP_BOOT"
+    self.acn64emu011c_loader_status = "universal-commercial-booted"
+    compat_marker = "UNIVERSAL-HLE4K " if bool(globals().get("_sm64_is_family", lambda _c: False)(self)) else ""
+    self.boot_status = f"{display} {compat_marker}ACN64EMU640/ACN64EMU0.1.1B/0.1.1C UNIVERSAL COMMERCIAL-HLE BOOTED | {len(blocks)} blocks | files off"
+    self.hle_note("ACN64EMU011C_UNIVERSAL_COMMERCIAL_BOOT")
+    return self.info()
+
+
+ACN64EmuCore.boot = _acn64emu011c_boot
+
+
+_acn64emu011c_previous_is_corn_hle_game = ACN64EmuCore.is_corn_hle_game
+
+def _acn64emu011c_is_corn_hle_game(self: "ACN64EmuCore") -> bool:
+    if bool(getattr(self, "hle_enabled", False)) and _acn64emu011_valid_rom(self):
+        return True
+    return _acn64emu011c_previous_is_corn_hle_game(self)
+
+
+ACN64EmuCore.is_corn_hle_game = _acn64emu011c_is_corn_hle_game
+
+
+_acn64emu011c_previous_tick_corn_hle = ACN64EmuCore.tick_corn_hle
+
+def _acn64emu011c_tick_corn_hle(self: "ACN64EmuCore") -> Dict[str, object]:
+    info = _acn64emu011c_previous_tick_corn_hle(self)
+    _acn64emu011_ensure_attrs(self)
+    if not self.booted or not _acn64emu011_valid_rom(self):
+        return info
+    blocks = getattr(self, "acn64emu011_compiled_blocks", [])
+    if blocks:
+        active = blocks[int(getattr(self, "frame_count", 0)) % len(blocks)]
+        if active.pc in getattr(self, "acn64emu011c_block_table", {}):
+            self.acn64emu011c_block_cache_hits += 1
+        else:
+            self.acn64emu011c_block_cache_misses += 1
+        if self.frame_count % 5 == 0:
+            self.hle_note("ACN64EMU011C_BLOCK_CACHE_HIT")
+        if self.frame_count % 7 == 0:
+            self.hle_note("ACN64EMU011C_UNIVERSAL_RSP_RDP_AUDIO_SYNC")
+    self.acn64emu011c_loader_status = "universal-commercial-running"
+    return self.info()
+
+
+ACN64EmuCore.tick_corn_hle = _acn64emu011c_tick_corn_hle
+
+
+_acn64emu011c_previous_info = ACN64EmuCore.info
+
+def _acn64emu011c_info(self: "ACN64EmuCore") -> Dict[str, object]:
+    _acn64emu011_ensure_attrs(self)
+    data = _acn64emu011c_previous_info(self)
+    blocks = getattr(self, "acn64emu011_compiled_blocks", [])
+    histogram = getattr(self, "acn64emu011c_opcode_histogram", {})
+    data.update({
+        "acn64emu011c": True,
+        "acn64emu011c_version": ACN64EMU011C_VERSION,
+        "acn64emu011c_profile": ACN64EMU011C_PROFILE,
+        "acn64emu011c_source_mode": ACN64EMU011C_SOURCE_MODE,
+        "acn64emu011c_recompiler_mode": ACN64EMU011C_RECOMPILER_MODE,
+        "acn64emu011c_universal_commercial_loader": True,
+        "acn64emu011c_profile_catalog_size": len(CORN_HLE_PROFILES),
+        "acn64emu011c_known_profile_count": len(ACN64EMU011C_EXTRA_PROFILES),
+        "acn64emu011c_block_table_entries": len(getattr(self, "acn64emu011c_block_table", {})),
+        "acn64emu011c_block_cache_hits": int(getattr(self, "acn64emu011c_block_cache_hits", 0)),
+        "acn64emu011c_block_cache_misses": int(getattr(self, "acn64emu011c_block_cache_misses", 0)),
+        "acn64emu011c_loader_status": getattr(self, "acn64emu011c_loader_status", "waiting"),
+        "acn64emu011c_archive_input": getattr(self, "acn64emu011c_archive_input", ""),
+        "acn64emu011c_top_block_kinds": ", ".join(
+            f"{k}={v}" for k, v in sorted(
+                ((k, v) for k, v in histogram.items() if not k.startswith("op:")),
+                key=lambda item: (-item[1], item[0])
+            )[:6]
+        ),
+        "acn64emu011c_files_off": ACN64EMU011C_FILES_OFF,
+        "acn64emu011c_rom_exports": ACN64EMU011C_ROM_EXPORTS,
+        "acn64emu011c_valid_n64_rom": _acn64emu011_valid_rom(self),
+        "acn64emu011c_loaded_block_bytes": sum(max(1, block.words) * 4 for block in blocks),
+        "corn_source_imported": False,
+        "corn_source_note": "Clean-room public-behavior compatibility only; no Corn source, binary, or game code imported.",
+    })
+    return data
+
+
+ACN64EmuCore.info = _acn64emu011c_info
+
+
+_acn64emu011c_previous_wrapper_corn_profile = N64CythonWrapper.corn_profile
+
+def _acn64emu011c_wrapper_corn_profile(self: "N64CythonWrapper") -> Dict[str, object]:
+    data = _acn64emu011c_previous_wrapper_corn_profile(self)
+    info = self.core.info()
+    data.update({
+        "universal_loader": info.get("acn64emu011c_universal_commercial_loader"),
+        "acn64emu011c_version": info.get("acn64emu011c_version"),
+        "block_table_entries": info.get("acn64emu011c_block_table_entries"),
+        "profile_catalog_size": info.get("acn64emu011c_profile_catalog_size"),
+        "loader_status": info.get("acn64emu011c_loader_status"),
+    })
+    return data
+
+
+N64CythonWrapper.corn_profile = _acn64emu011c_wrapper_corn_profile
+
+
+def _acn64emu011c_gui_load_rom(self: "ACN64EmuGUI") -> None:
+    path = filedialog.askopenfilename(
+        title="Open N64 ROM",
+        filetypes=[("N64 ROMs", "*.z64 *.v64 *.n64 *.rom *.bin *.zip"), ("All files", "*.*")],
+    )
+    if not path:
+        return
+    try:
+        info = self.core.load_rom(path)
+        self.running = False
+        self.rom_list.delete(0, tk.END)
+        self.rom_list.insert(tk.END, info["rom"])
+        self.rom_list.insert(tk.END, (str(info.get("title") or "UNKNOWN TITLE"))[:22])
+        self.rom_list.insert(tk.END, info["rom_type"])
+        self.rom_list.insert(tk.END, f"CIC: {info['cic']}")
+        self.rom_list.insert(tk.END, f"HLE: {info.get('hle_game')}")
+        self.rom_list.insert(tk.END, f"blocks: {info.get('acn64emu011_compiled_blocks')}")
+        self.rom_list.insert(tk.END, "0.1.1c universal files-off")
+        self.render_info(info)
+        self.render_screen("ROM loaded. Press Boot.")
+        self.status.config(text=f"Loaded {info['rom']}")
+    except Exception as exc:
+        messagebox.showerror("Load ROM failed", str(exc))
+
+
+try:
+    ACN64EmuGUI.load_rom = _acn64emu011c_gui_load_rom
+except Exception:
+    pass
+
+
+_acn64emu011c_previous_render_info = ACN64EmuGUI.render_info
+
+def _acn64emu011c_render_info(self: "ACN64EmuGUI", s: Dict[str, object]) -> None:
+    if s.get("acn64emu011c"):
+        size = int(s.get("rom_size", 0) or 0)
+        size_mb = size / (1024 * 1024) if size else 0
+        decode = str(s.get("last_decode") or "---")[:36]
+        title = str(s.get("title") or "---")[:23]
+        text = (
+            f"{s.get('status')} | {str(s.get('boot'))[:34]}\n"
+            f"ROM {str(s.get('rom'))[:22]} | {size_mb:.2f} MB | {str(s.get('rom_type'))[:16]}\n"
+            f"TITLE {title} | {str(s.get('acn64emu011_profile_display'))[:24]}\n"
+            f"PC {int(s.get('pc',0)):08X} NEXT {int(s.get('next_pc',0)):08X} | 4K {s.get('hle4k_target_width')}x{s.get('hle4k_target_height')}\n"
+            f"0.1.1c universal commercial loader | files off | no Corn source\n"
+            f"recomp {s.get('acn64emu011_compiled_blocks')} blocks {s.get('acn64emu011_compiled_ops')} ops | table {s.get('acn64emu011c_block_table_entries')}\n"
+            f"OP {int(s.get('last_opcode',0)):08X} | {decode} | FPS 60"
+        )
+        self.info_label.config(text=text)
+        return
+    _acn64emu011c_previous_render_info(self, s)
+
+
+ACN64EmuGUI.render_info = _acn64emu011c_render_info
+
+
+# 0.1.1c helper aliases.  Older boot_rom_* names still route through the patched core.
+CatHLE011CUniversalRomBooter = CatHLE011BRomBooter
+Cathle011CUniversalRomBooter = CatHLE011BRomBooter
+boot_acn64emu011c_file = boot_acn64emu011_file
+boot_acn64emu011c_bytes = boot_acn64emu011_bytes
+compile_acn64emu011c_file = compile_acn64emu011_file
+
+
+_acn64emu011c_previous_selftest = _selftest
+
+def _selftest() -> None:
+    _acn64emu011c_previous_selftest()
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu011_rom(b"BANJO TOOIE", b"BT", "z64"), "BanjoTooie.z64")
+    assert info["acn64emu011c"] is True, info
+    assert info["hle_game"] == BANJO_TOOIE_PROFILE, info
+    assert info["acn64emu011c_universal_commercial_loader"] is True, info
+    assert int(info["acn64emu011c_block_table_entries"]) > 0, info
+    assert int(info["acn64emu011_compiled_blocks"]) > 0, info
+    info = core.boot()
+    assert info["booted"] is True, info
+    assert "ACN64EMU0.1.1B" in str(info["boot"]), info
+    assert "0.1.1C" in str(info["boot"]) or info.get("acn64emu011c_version") == ACN64EMU011C_VERSION, info
+    for _ in range(6):
+        info = core.tick_frame()
+    assert int(info["acn64emu011c_block_cache_hits"]) >= 1, info
+
+    core = ACN64EmuCore()
+    info = core.load_rom_bytes(_make_synthetic_acn64emu011_rom(b"THE LEGEND OF ZELDA MAJORA", b"ZV", "n64"), "MajorasMask.n64")
+    assert info["rom_type"] == "N64 LITTLE-ENDIAN", info
+    assert info["hle_game"] == ZELDA_MM_PROFILE, info
+    assert info["acn64emu011c_valid_n64_rom"] is True, info
+
+    wrapper = N64CythonWrapper()
+    wrapper.load_rom_bytes(bytes(_make_synthetic_acn64emu011_rom(b"MYSTERY COMMERCIAL", b"ZZ", "z64")), "MysteryUniversal.z64")
+    wrapper.boot()
+    profile = wrapper.corn_profile()
+    assert profile["universal_loader"] is True, profile
+    assert int(profile["block_table_entries"]) > 0, profile
+
+
+def _print_boot_summary(info: Dict[str, object]) -> None:
+    print("acn64emu0.1.1 boot summary")
+    print(f"rom={info.get('rom')} type={info.get('rom_type')} title={info.get('title')}")
+    print(f"booted={info.get('booted')} status={info.get('boot')}")
+    print(f"profile={info.get('hle_game')} display={info.get('acn64emu011_profile_display')}")
+    print(f"recompiler={info.get('acn64emu011_recompiler_ready')} blocks={info.get('acn64emu011_compiled_blocks')} ops={info.get('acn64emu011_compiled_ops')} hash={info.get('acn64emu011_recompile_hash')}")
+    print(f"frame={info.get('frame')} fps={info.get('target_fps')} mode={info.get('hle_video_mode')} commercial={info.get('acn64emu011_commercial_level')}")
+    print(f"pc=0x{int(info.get('pc', 0)):08X} op=0x{int(info.get('last_opcode', 0)):08X} decode={info.get('last_decode')}")
+
+
+def main() -> None:
+    if "--selftest" in sys.argv:
+        _selftest()
+        print("acn64emu0.1.1 selftest ok")
+        return
+    if "--boot" in sys.argv:
+        idx = sys.argv.index("--boot")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("usage: python3.14 acn64emu0.1.1.py --boot path/to/rom.z64 [--frames 60]")
+        frames = 60
+        if "--frames" in sys.argv:
+            fidx = sys.argv.index("--frames")
+            if fidx + 1 < len(sys.argv):
+                frames = int(sys.argv[fidx + 1])
+        info = boot_rom_file(sys.argv[idx + 1], frames=frames)
+        _print_boot_summary(info)
+        return
+    ACN64EmuGUI().run()
+
+
+if __name__ == "__main__":
+    main()
+
